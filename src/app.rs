@@ -1,6 +1,7 @@
 use crate::{
     api::{Metadata, Query},
     assets::{self, Loaded, Source},
+    cloud::{self, Job as CloudJob},
     settings::{Settings, Theme},
     system::{self, Appearance},
     worker::{DiskJob, Event, NetJob, Workers},
@@ -26,6 +27,8 @@ struct Item {
 enum View {
     Discover,
     Collection,
+    Favorites,
+    Albums,
 }
 
 pub struct GalleryApp {
@@ -60,7 +63,29 @@ pub struct GalleryApp {
     thumb_order: VecDeque<PathBuf>,
     thumb_pending: HashSet<PathBuf>,
     thumb_failed: HashSet<PathBuf>,
+    remote_thumbs: HashMap<String, TextureHandle>,
+    remote_pending: HashSet<String>,
+    remote_failed: HashSet<String>,
     settings_open: bool,
+    settings_tab: u8,
+    filters_open: bool,
+    account_open: bool,
+    cloud: cloud::Worker,
+    cloud_data: cloud::Data,
+    cloud_user: Option<String>,
+    cloud_busy: bool,
+    cloud_last: Instant,
+    cloud_status: String,
+    cloud_error: bool,
+    login_name: String,
+    login_password: String,
+    login_register: bool,
+    pending_appearance: Option<cloud::Appearance>,
+    appearance_retry: Instant,
+    album_name: String,
+    album_selected: Option<String>,
+    album_rename: String,
+    album_confirm_delete: bool,
     dirty: Option<Instant>,
     status: String,
     error: bool,
@@ -78,6 +103,10 @@ impl GalleryApp {
         let workers = Workers::start(cc.egui_ctx.clone());
         let _ = workers.net.try_send(NetJob::Tags);
         let _ = workers.disk.try_send(DiskJob::Appearance);
+        let cloud = cloud::Worker::start(cc.egui_ctx.clone());
+        let _ = cloud
+            .tx
+            .try_send(CloudJob::Resume(settings.sync_server.clone()));
         let mut app = Self {
             base,
             settings,
@@ -113,11 +142,33 @@ impl GalleryApp {
             thumb_order: VecDeque::new(),
             thumb_pending: HashSet::new(),
             thumb_failed: HashSet::new(),
+            remote_thumbs: HashMap::new(),
+            remote_pending: HashSet::new(),
+            remote_failed: HashSet::new(),
             settings_open: false,
+            settings_tab: 0,
+            filters_open: false,
+            account_open: false,
+            cloud,
+            cloud_data: cloud::Data::default(),
+            cloud_user: None,
+            cloud_busy: true,
+            cloud_last: Instant::now(),
+            cloud_status: "Проверяем сохранённый вход…".into(),
+            cloud_error: false,
+            login_name: String::new(),
+            login_password: String::new(),
+            login_register: false,
+            pending_appearance: None,
+            appearance_retry: Instant::now(),
+            album_name: String::new(),
+            album_selected: None,
+            album_rename: String::new(),
+            album_confirm_delete: false,
             dirty: None,
             status: warning
                 .clone()
-                .unwrap_or("Выбери тег. Найди что-то своё.".into()),
+                .unwrap_or("Нажми «Новая картинка», чтобы начать.".into()),
             error: warning.is_some(),
             started: Instant::now(),
             smoke,
@@ -386,6 +437,29 @@ impl GalleryApp {
     fn events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.workers.events.try_recv() {
             match event {
+                Event::RemoteThumb(key, result) => {
+                    self.remote_pending.remove(&key);
+                    match result {
+                        Ok(image) => {
+                            if self.remote_thumbs.len() >= 128 {
+                                if let Some(old) = self.remote_thumbs.keys().next().cloned() {
+                                    self.remote_thumbs.remove(&old);
+                                }
+                            }
+                            self.remote_thumbs.insert(
+                                key.clone(),
+                                ctx.load_texture(
+                                    format!("cloud-{key}"),
+                                    image,
+                                    TextureOptions::LINEAR,
+                                ),
+                            );
+                        }
+                        Err(_) => {
+                            self.remote_failed.insert(key);
+                        }
+                    }
+                }
                 Event::Tags(result) => {
                     self.tags_loading = false;
                     match result {
@@ -466,7 +540,10 @@ impl GalleryApp {
                                 }
                             }
                             self.smoke_path = Some(path.clone());
-                            self.message(format!("Сохранено: {}", path.display()), false);
+                            self.message(
+                                "Картинка сохранена. Она доступна в разделе «Сохранённое».",
+                                false,
+                            );
                             self.scan();
                         }
                         Err(e) => self.message(format!("Не удалось сохранить: {e}"), true),
@@ -538,172 +615,79 @@ impl GalleryApp {
     }
     fn sidebar(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("sidebar")
-            .exact_width(238.0)
+            .exact_width(206.0)
             .resizable(false)
-            .frame(egui::Frame::new().fill(self.panel()).inner_margin(20))
+            .frame(egui::Frame::new().fill(self.panel()).inner_margin(18))
             .show(ctx, |ui| {
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    egui::Frame::new()
-                        .fill(self.ac())
-                        .corner_radius(11)
-                        .inner_margin(10)
-                        .show(ui, |ui| {
-                            let [r, g, b] = system::contrast_text(self.accent());
-                            ui.label(
-                                RichText::new("W")
-                                    .strong()
-                                    .size(22.0)
-                                    .color(Color32::from_rgb(r, g, b)),
-                            );
-                        });
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new("waifu").size(24.0).strong());
-                        ui.label(
-                            RichText::new("G A L L E R Y")
-                                .size(10.0)
-                                .color(self.muted()),
-                        );
-                    });
-                });
-                ui.add_space(24.0);
-                for (view, label) in [
-                    (View::Discover, "Обзор"),
-                    (View::Collection, "Моя коллекция"),
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new("waifu")
+                        .size(31.0)
+                        .strong()
+                        .color(self.ac_text()),
+                );
+                ui.label(RichText::new("Твоя галерея").size(12.0).color(self.muted()));
+                ui.add_space(30.0);
+                for (view, label, hint) in [
+                    (View::Discover, "Просмотр", "Новые картинки и история"),
+                    (View::Collection, "Сохранённое", "Файлы на этом компьютере"),
+                    (
+                        View::Favorites,
+                        "Избранное",
+                        "Синхронизация между устройствами",
+                    ),
+                    (View::Albums, "Альбомы", "Твои подборки изображений"),
                 ] {
                     let active = self.view == view;
                     if ui
                         .add_sized(
-                            [ui.available_width(), 42.0],
+                            [ui.available_width(), 44.0],
                             egui::Button::new(RichText::new(label).strong()).fill(if active {
                                 self.ac().gamma_multiply(0.22)
                             } else {
                                 Color32::TRANSPARENT
                             }),
                         )
+                        .on_hover_text(hint)
                         .clicked()
                     {
                         self.view = view;
                     }
                 }
-                ui.add_space(22.0);
-                ui.label(
-                    RichText::new("ФИЛЬТРЫ")
-                        .size(11.0)
-                        .color(self.muted())
-                        .strong(),
-                );
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    for mode in ["SFW", "NSFW"] {
-                        if ui
-                            .add_sized(
-                                [89.0, 36.0],
-                                egui::Button::new(RichText::new(mode).strong().color(
-                                    if self.settings.mode == mode {
-                                        let [r, g, b] = system::contrast_text(self.accent());
-                                        Color32::from_rgb(r, g, b)
-                                    } else {
-                                        ui.visuals().text_color()
-                                    },
-                                ))
-                                .fill(if self.settings.mode == mode {
-                                    self.ac()
-                                } else {
-                                    self.card()
-                                })
-                                .stroke(egui::Stroke::NONE)
-                                .corner_radius(9),
-                            )
-                            .clicked()
-                            && self.settings.mode != mode
-                        {
-                            self.settings.mode = mode.into();
-                            self.invalidate();
-                        }
-                    }
-                });
-                if self.settings.use_custom_url {
-                    ui.label(
-                        RichText::new("Свой API · фильтры задаются URL")
-                            .size(11.0)
-                            .color(self.muted()),
-                    );
-                }
-                ui.add_space(8.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.tag_search)
-                        .hint_text("Найти тег…")
-                        .desired_width(f32::INFINITY),
-                );
-                if self.tags_loading {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.small("Загружаем теги");
-                    });
-                }
-                let tags: Vec<_> = self
-                    .tags
-                    .iter()
-                    .filter(|tag| tag.contains(&self.tag_search.to_lowercase()))
-                    .cloned()
-                    .collect();
-                let height = (ui.available_height() - 130.0).max(100.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("tags")
-                    .max_height(height)
-                    .show(ui, |ui| {
-                        for tag in tags {
-                            let active = self.settings.category == tag;
-                            let text = tag.replace('-', " ");
-                            let (rect, response) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), 32.0),
-                                egui::Sense::click(),
-                            );
-                            if active || response.hovered() {
-                                ui.painter().rect_filled(
-                                    rect,
-                                    8,
-                                    if active {
-                                        self.ac().gamma_multiply(0.15)
-                                    } else {
-                                        self.card()
-                                    },
-                                );
-                            }
-                            ui.painter().text(
-                                rect.left_center() + egui::vec2(12.0, 0.0),
-                                egui::Align2::LEFT_CENTER,
-                                text,
-                                egui::FontId::proportional(14.0),
-                                if active {
-                                    self.ac_text()
-                                } else {
-                                    ui.visuals().text_color()
-                                },
-                            );
-                            if response
-                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                .clicked()
-                                && !active
-                            {
-                                self.settings.category = tag;
-                                self.invalidate();
-                            }
-                        }
-                    });
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                     ui.label(
                         RichText::new("Изображения · Waifu.im")
                             .size(10.0)
                             .color(self.muted()),
                     );
-                    ui.add_space(10.0);
+                    ui.add_space(12.0);
                     if ui
                         .add_sized([ui.available_width(), 38.0], egui::Button::new("Настройки"))
                         .clicked()
                     {
                         self.settings_open = true;
+                    }
+                    let label = self.cloud_user.as_deref().unwrap_or("Войти в аккаунт");
+                    if ui
+                        .add_sized([ui.available_width(), 42.0], egui::Button::new(label))
+                        .clicked()
+                    {
+                        self.account_open = true;
+                    }
+                    if self.cloud_user.is_some() {
+                        ui.label(
+                            RichText::new(if self.cloud_error {
+                                "Нет связи с сервером"
+                            } else if self.pending_appearance.is_some() {
+                                "Оформление ожидает отправки"
+                            } else if self.cloud_busy {
+                                "Синхронизация…"
+                            } else {
+                                "Аккаунт подключён"
+                            })
+                            .size(11.0)
+                            .color(self.muted()),
+                        );
                     }
                 });
             });
@@ -712,70 +696,195 @@ impl GalleryApp {
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(
-                    RichText::new(if self.view == View::Discover {
-                        "DISCOVER  /  WAIFU.IM"
-                    } else {
-                        "LIBRARY  /  ТВОЯ КОЛЛЕКЦИЯ"
+                    RichText::new(match self.view {
+                        View::Discover => "Находи то, что нравится",
+                        View::Collection => "На этом компьютере",
+                        View::Favorites => "Всегда под рукой",
+                        View::Albums => "Всё по своим местам",
                     })
-                    .size(10.0)
-                    .strong()
+                    .size(12.0)
                     .color(self.muted()),
                 );
                 ui.label(
-                    RichText::new(if self.view == View::Discover {
-                        "Твоя следующая находка"
-                    } else {
-                        "Всё, что вдохновляет"
+                    RichText::new(match self.view {
+                        View::Discover => "Просмотр",
+                        View::Collection => "Сохранённое",
+                        View::Favorites => "Избранное",
+                        View::Albums => "Альбомы",
                     })
-                    .size(27.0)
+                    .size(29.0)
                     .strong(),
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self
-                    .primary(
-                        ui,
-                        if self.waiting {
-                            "Загрузка…"
-                        } else {
-                            "Следующая"
-                        },
-                        !self.waiting,
-                    )
-                    .clicked()
-                {
-                    self.next(ctx);
-                }
-                let (enabled, label) = self
-                    .selected
-                    .map(|i| {
-                        let item = &self.history[i];
-                        (
-                            !item.saved && !self.saving.contains(&item.meta.key),
-                            if item.saved {
-                                "Сохранено"
-                            } else if self.saving.contains(&item.meta.key) {
-                                "Сохраняем…"
+                if self.view == View::Discover {
+                    if self
+                        .primary(
+                            ui,
+                            if self.waiting {
+                                "Загрузка…"
                             } else {
-                                "Сохранить"
+                                "Новая картинка"
                             },
+                            !self.waiting && !self.opening,
                         )
-                    })
-                    .unwrap_or((false, "Сохранить"));
-                if ui
-                    .add_enabled(
-                        enabled,
-                        egui::Button::new(label).min_size(egui::vec2(130.0, 42.0)),
-                    )
-                    .clicked()
+                        .clicked()
+                    {
+                        self.next(ctx);
+                    }
+                    let (enabled, label) = self
+                        .selected
+                        .map(|i| {
+                            let item = &self.history[i];
+                            (
+                                !item.saved && !self.saving.contains(&item.meta.key),
+                                if item.saved {
+                                    "Сохранено"
+                                } else if self.saving.contains(&item.meta.key) {
+                                    "Сохраняем…"
+                                } else {
+                                    "Сохранить"
+                                },
+                            )
+                        })
+                        .unwrap_or((false, "Сохранить"));
+                    if ui
+                        .add_enabled(
+                            enabled,
+                            egui::Button::new(label).min_size(egui::vec2(110.0, 42.0)),
+                        )
+                        .clicked()
+                    {
+                        self.save_current();
+                    }
+                    let meta = self.selected.map(|i| self.history[i].meta.clone());
+                    if let Some(meta) = meta {
+                        let favorite = self.cloud_data.favorites.iter().any(|p| p.key == meta.key);
+                        if ui
+                            .add_enabled(
+                                !self.cloud_busy
+                                    && (meta.key.starts_with("https://")
+                                        || meta.key.starts_with("http://")),
+                                egui::Button::new(if favorite {
+                                    "В избранном"
+                                } else {
+                                    "В избранное"
+                                })
+                                .min_size(egui::vec2(110.0, 42.0)),
+                            )
+                            .clicked()
+                        {
+                            if self.cloud_user.is_none() {
+                                self.account_open = true;
+                            } else if favorite {
+                                self.cloud_send(CloudJob::Op(
+                                    serde_json::json!({"op":"favorite_remove","key":meta.key}),
+                                ));
+                            } else {
+                                self.cloud_send(CloudJob::Op(
+                                    serde_json::json!({"op":"favorite_put","picture":meta}),
+                                ));
+                            }
+                        }
+                    }
+                } else if self.view == View::Collection {
+                    if ui.button("Обновить").clicked() {
+                        self.scan();
+                    }
+                } else if self.cloud_user.is_some()
+                    && ui
+                        .add_enabled(!self.cloud_busy, egui::Button::new("Синхронизировать"))
+                        .clicked()
                 {
-                    self.save_current();
+                    self.cloud_send(CloudJob::Refresh);
                 }
             });
         });
-        ui.add_space(16.0);
+        ui.add_space(14.0);
+        if self.view == View::Discover {
+            ui.horizontal(|ui| {
+                if ui
+                    .button(format!(
+                        "Категория: {}…",
+                        tag_label(&self.settings.category)
+                    ))
+                    .clicked()
+                {
+                    self.filters_open = true;
+                }
+                for (mode, label) in [("SFW", "Обычные"), ("NSFW", "18+")] {
+                    if ui
+                        .selectable_label(self.settings.mode == mode, label)
+                        .clicked()
+                        && self.settings.mode != mode
+                    {
+                        self.settings.mode = mode.into();
+                        self.invalidate();
+                    }
+                }
+                if self.settings.use_custom_url {
+                    ui.small("Свой источник");
+                }
+            });
+            ui.add_space(12.0);
+        }
+    }
+    fn filters_window(&mut self, ctx: &egui::Context) {
+        if !self.filters_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Выбрать категорию")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(470.0)
+            .show(ctx, |ui| {
+                ui.label("Выбери настроение для следующих изображений");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.tag_search)
+                        .hint_text("Поиск категории…")
+                        .desired_width(f32::INFINITY),
+                );
+                if self.tags_loading {
+                    ui.spinner();
+                }
+                let search = self.tag_search.to_lowercase();
+                let tags: Vec<_> = self
+                    .tags
+                    .iter()
+                    .filter(|t| {
+                        t.contains(&search) || tag_label(t).to_lowercase().contains(&search)
+                    })
+                    .cloned()
+                    .collect();
+                if tags.is_empty() {
+                    ui.label("Ничего не найдено");
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(340.0)
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for tag in tags {
+                                if ui
+                                    .selectable_label(
+                                        self.settings.category == tag,
+                                        tag_label(&tag),
+                                    )
+                                    .clicked()
+                                {
+                                    self.settings.category = tag;
+                                    self.invalidate();
+                                    self.filters_open = false;
+                                }
+                            }
+                        });
+                    });
+            });
+        self.filters_open &= open;
     }
     fn viewer(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
         let film_height = if self.history.is_empty() { 0.0 } else { 116.0 };
         let canvas_height = (ui.available_height() - film_height - 68.0).max(230.0);
         egui::Frame::new()
@@ -840,9 +949,18 @@ impl GalleryApp {
                             ui.add_space(16.0);
                             ui.label(RichText::new("Место для вдохновения").size(25.0).strong());
                             ui.label(
-                                RichText::new("Выбери тег и нажми «Следующая».")
-                                    .color(self.muted()),
+                                RichText::new(
+                                    "Нажми «Новая картинка» — мы найдём что-нибудь для тебя.",
+                                )
+                                .color(self.muted()),
                             );
+                            ui.add_space(14.0);
+                            if self
+                                .primary(ui, "Найти первую картинку", !self.waiting)
+                                .clicked()
+                            {
+                                self.next(&ctx);
+                            }
                             ui.label(
                                 RichText::new("Или просто нажми пробел.")
                                     .size(12.0)
@@ -861,8 +979,16 @@ impl GalleryApp {
                         .strong(),
                 );
                 ui.label(
-                    RichText::new(format!("{}  /  {}", item.meta.mode, item.meta.tag))
-                        .color(self.muted()),
+                    RichText::new(format!(
+                        "{} · {}",
+                        if item.meta.mode == "NSFW" {
+                            "18+"
+                        } else {
+                            "Обычные"
+                        },
+                        tag_label(&item.meta.tag)
+                    ))
+                    .color(self.muted()),
                 );
                 if !item.meta.artist.is_empty() {
                     ui.label(RichText::new(&item.meta.artist).color(self.muted()));
@@ -1097,78 +1223,51 @@ impl GalleryApp {
         if !self.settings_open {
             return;
         }
+        let appearance_before = cloud::Appearance::from_settings(&self.settings);
         let before = serde_json::to_string(&self.settings).unwrap_or_default();
         let old_query = self.query();
         let old_roots = self.settings.library_roots(&self.base);
-        let mut open = self.settings_open;
-        egui::Window::new("Настройки").open(&mut open).default_width(510.0).default_height(680.0).default_pos(ctx.screen_rect().center()-egui::vec2(260.0,340.0)).resizable(false)
-            .collapsible(false).show(ctx,|ui|{
-                egui::ScrollArea::vertical().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible).max_height(580.0).show(ui,|ui|{
-                    ui.label(RichText::new("Сделай галерею своей").size(23.0).strong());
-                    ui.label(RichText::new("Оформление применяется сразу.").color(self.muted()));
-                    ui.add_space(14.0);ui.strong("Тема");
-                    ui.horizontal(|ui|{
-                        for (value,label) in [(Theme::Light,"Светлая"),(Theme::Dark,"Тёмная"),(Theme::System,"Как в Windows")]{
-                            ui.selectable_value(&mut self.settings.theme,value,label);
+        let mut open = true;
+        egui::Window::new("Настройки").open(&mut open).default_width(560.0).default_height(430.0)
+            .default_pos(ctx.screen_rect().center()-egui::vec2(280.0,230.0)).resizable(false).collapsible(false).show(ctx,|ui|{
+                ui.horizontal(|ui|{for (i,label) in [(0,"Оформление"),(1,"Сохранение"),(2,"Дополнительно")]{ui.selectable_value(&mut self.settings_tab,i,label);}});
+                ui.add_space(16.0);
+                egui::ScrollArea::vertical().max_height(470.0).show(ui,|ui|{
+                    ui.set_min_height(300.0);
+                    match self.settings_tab{
+                        0=>{
+                            ui.label(RichText::new("Сделай галерею своей").size(24.0).strong());ui.label("Все изменения видны сразу.");ui.add_space(18.0);
+                            ui.strong("Тема");ui.horizontal(|ui|{for (value,label) in [(Theme::Light,"Светлая"),(Theme::Dark,"Тёмная"),(Theme::System,"Как в Windows")]{ui.selectable_value(&mut self.settings.theme,value,label);}});
+                            ui.add_space(16.0);ui.strong("Акцентный цвет");ui.checkbox(&mut self.settings.system_accent,"Использовать цвет Windows");
+                            ui.horizontal(|ui|{for rgb in [[159,123,255],[235,110,171],[76,164,255],[55,187,157],[245,169,77],[233,103,104]]{if ui.add(egui::Button::new("   ").fill(Color32::from_rgb(rgb[0],rgb[1],rgb[2])).min_size(egui::vec2(38.0,34.0))).on_hover_text(format!("#{:02X}{:02X}{:02X}",rgb[0],rgb[1],rgb[2])).clicked(){self.settings.accent=rgb;self.settings.system_accent=false;}}if ui.color_edit_button_srgb(&mut self.settings.accent).changed(){self.settings.system_accent=false;}});
+                            ui.add_space(16.0);if ui.button("Сбросить оформление").clicked(){self.settings.theme=Theme::System;self.settings.accent=[159,123,255];self.settings.system_accent=true;}
+                            if self.cloud_user.is_some(){ui.small("Тема и акцент синхронизируются с аккаунтом.");}
+                        },
+                        1=>{
+                            ui.label(RichText::new("Куда сохранять картинки").size(24.0).strong());ui.add_space(16.0);
+                            ui.radio_value(&mut self.settings.save_mode,"A".into(),"Распределять по режиму и категории");ui.radio_value(&mut self.settings.save_mode,"B".into(),"В одну папку images");ui.radio_value(&mut self.settings.save_mode,"C".into(),"В выбранную папку");
+                            if self.settings.save_mode=="C"{ui.horizontal(|ui|{ui.add(egui::TextEdit::singleline(&mut self.settings.custom_save_folder).hint_text("Путь к папке").desired_width(350.0));if ui.button("Выбрать…").clicked(){if let Some(path)=rfd::FileDialog::new().pick_folder(){self.settings.custom_save_folder=path.to_string_lossy().into();}}});}
+                            ui.add_space(10.0);ui.label(RichText::new("PNG в полном разрешении. Существующие файлы не заменяются.").size(12.0).color(self.muted()));
+                            ui.add_space(16.0);ui.strong("Показывать в разделе «Сохранённое»");
+                            egui::ComboBox::from_id_salt("load-mode").selected_text(match self.settings.load_saved_mode{1=>"Текущую категорию",2=>"Все категории текущего режима",_=>"Все изображения"}).show_ui(ui,|ui|{ui.selectable_value(&mut self.settings.load_saved_mode,1,"Текущую категорию");ui.selectable_value(&mut self.settings.load_saved_mode,2,"Все категории текущего режима");ui.selectable_value(&mut self.settings.load_saved_mode,3,"Все изображения");});
+                            ui.small("Пути к папкам и скачанные файлы остаются на этом устройстве.");
+                        },
+                        _=>{
+                            ui.label(RichText::new("Загрузка и управление").size(24.0).strong());ui.add_space(16.0);
+                            ui.checkbox(&mut self.settings.prefetch,"Предзагружать следующую картинку");ui.small("Следующая картинка будет готова быстрее. Расходует трафик.");
+                            ui.add_space(14.0);ui.collapsing("Пользовательский источник",|ui|{ui.checkbox(&mut self.settings.use_custom_url,"Использовать свой API");ui.add_enabled(self.settings.use_custom_url,egui::TextEdit::singleline(&mut self.settings.custom_url).hint_text("https://…").desired_width(f32::INFINITY));ui.small("JSON с items[0].url или url. Категории задаются в URL.");});
+                            ui.add_space(18.0);ui.strong("Горячие клавиши");ui.label("Пробел / N — новая картинка\nS — сохранить\n← / → — история\nCtrl+, — настройки");
                         }
-                    });
-                    ui.add_space(12.0);ui.strong("Акцентный цвет");
-                    ui.checkbox(&mut self.settings.system_accent,"Использовать цвет Windows");
-                    ui.horizontal(|ui|{
-                        for rgb in [[159,123,255],[235,110,171],[76,164,255],[55,187,157],[245,169,77],[233,103,104]] {
-                            let button=egui::Button::new("   ").fill(Color32::from_rgb(rgb[0],rgb[1],rgb[2]))
-                                .min_size(egui::vec2(38.0,32.0));
-                            if ui.add(button).on_hover_text(format!("#{:02X}{:02X}{:02X}",rgb[0],rgb[1],rgb[2])).clicked(){
-                                self.settings.accent=rgb;self.settings.system_accent=false;
-                            }
-                        }
-                        if ui.color_edit_button_srgb(&mut self.settings.accent).changed(){self.settings.system_accent=false;}
-                    });
-                    ui.add_space(12.0);ui.separator();ui.add_space(4.0);
-                    ui.strong("Сохранение");
-                    ui.horizontal(|ui|{
-                        ui.selectable_value(&mut self.settings.save_mode,"A".into(),"По режиму и тегу");
-                        ui.selectable_value(&mut self.settings.save_mode,"B".into(),"В одну папку");
-                        ui.selectable_value(&mut self.settings.save_mode,"C".into(),"Своя папка");
-                    });
-                    if self.settings.save_mode=="C" {
-                        ui.horizontal(|ui|{
-                            ui.add(egui::TextEdit::singleline(&mut self.settings.custom_save_folder).hint_text("Путь к папке").desired_width(330.0));
-                            if ui.button("Выбрать…").clicked(){
-                                if let Some(path)=rfd::FileDialog::new().pick_folder(){self.settings.custom_save_folder=path.to_string_lossy().into();}
-                            }
-                        });
-                    }
-                    ui.label(RichText::new("PNG в полном разрешении. Существующие файлы не заменяются.").size(12.0).color(self.muted()));
-                    ui.add_space(10.0);ui.strong("Локальная коллекция");
-                    egui::ComboBox::from_id_salt("load-mode")
-                        .selected_text(match self.settings.load_saved_mode{1=>"Текущий тег",2=>"Все теги текущего режима",_=>"Все изображения"})
-                        .show_ui(ui,|ui|{
-                            ui.selectable_value(&mut self.settings.load_saved_mode,1,"Текущий тег");
-                            ui.selectable_value(&mut self.settings.load_saved_mode,2,"Все теги текущего режима");
-                            ui.selectable_value(&mut self.settings.load_saved_mode,3,"Все изображения");
-                        });
-                    ui.add_space(12.0);ui.separator();ui.add_space(4.0);
-                    ui.strong("Быстродействие");
-                    ui.checkbox(&mut self.settings.prefetch,"Предзагружать следующую картинку");
-                    ui.label(RichText::new("Один кадр вперёд. Использует дополнительный трафик.").size(12.0).color(self.muted()));
-                    ui.label(RichText::new("История: до 48 кадров / 96 МБ оригиналов. Миниатюры: до 128 в кэше.").size(11.0).color(self.muted()));
-                    ui.add_space(12.0);ui.collapsing("Свой API",|ui|{
-                        ui.checkbox(&mut self.settings.use_custom_url,"Использовать пользовательский URL");
-                        ui.add_enabled(self.settings.use_custom_url,egui::TextEdit::singleline(&mut self.settings.custom_url)
-                            .hint_text("https://…").desired_width(f32::INFINITY));
-                        ui.label(RichText::new("JSON с items[0].url или url. Фильтры задаются в URL.").size(12.0).color(self.muted()));
-                    });
-                    ui.add_space(12.0);ui.separator();
-                    ui.label(RichText::new("Пробел / N — следующая   ·   S — сохранить
-← / → — история   ·   Ctrl+, — настройки").size(12.0).color(self.muted()));
-                    ui.add_space(6.0);
-                    if ui.button("Сбросить оформление").clicked(){
-                        self.settings.theme=Theme::System;self.settings.accent=[159,123,255];self.settings.system_accent=true;
                     }
                 });
             });
         self.settings_open = open;
+        let appearance_after = cloud::Appearance::from_settings(&self.settings);
+        if appearance_before != appearance_after && self.cloud_user.is_some() {
+            self.pending_appearance = Some(appearance_after);
+            self.appearance_retry = Instant::now() + Duration::from_millis(600);
+            self.cloud_status = "Оформление ожидает синхронизации".into();
+        }
         if serde_json::to_string(&self.settings).unwrap_or_default() != before {
             self.changed();
             if self.query() != old_query {
@@ -1182,6 +1281,17 @@ impl GalleryApp {
         }
     }
     fn housekeeping(&mut self, ctx: &egui::Context) {
+        if self.cloud_user.is_some() && !self.cloud_busy {
+            if self.pending_appearance.is_some() && Instant::now() >= self.appearance_retry {
+                let a = self.pending_appearance.clone().unwrap();
+                self.cloud_send(CloudJob::Op(
+                    serde_json::json!({"op":"appearance","appearance":a}),
+                ));
+                self.appearance_retry = Instant::now() + Duration::from_secs(30);
+            } else if self.cloud_last.elapsed() > Duration::from_secs(30) {
+                self.cloud_send(CloudJob::Refresh);
+            }
+        }
         if self.scan_due
             && !self.scanning
             && self
@@ -1247,6 +1357,7 @@ impl GalleryApp {
                 6 => "preview-light.png",
                 8 => "preview-settings.png",
                 10 => "preview-collection.png",
+                14 => "preview-account.png",
                 _ => "preview.png",
             };
             let rgba: Vec<u8> = image.pixels.iter().flat_map(|p| p.to_array()).collect();
@@ -1269,6 +1380,12 @@ impl GalleryApp {
                 }
                 8 => {
                     self.settings_open = false;
+                    self.account_open = true;
+                    self.capture_after = Instant::now() + Duration::from_millis(400);
+                    self.smoke_phase = 13;
+                }
+                14 => {
+                    self.account_open = false;
                     self.view = View::Collection;
                     self.smoke_phase = 9;
                 }
@@ -1308,6 +1425,10 @@ impl GalleryApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
                 self.smoke_phase = 8;
             }
+            13 if Instant::now() >= self.capture_after => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+                self.smoke_phase = 14;
+            }
             9 if self
                 .library
                 .iter()
@@ -1344,6 +1465,7 @@ impl GalleryApp {
 impl eframe::App for GalleryApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.events(ctx);
+        self.cloud_events();
         if ctx.input(|i| i.viewport().close_requested()) && !self.saving.is_empty() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.closing = true;
@@ -1398,7 +1520,7 @@ impl eframe::App for GalleryApp {
                     .on_hover_text(&self.status);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            RichText::new("SPACE  следующая     S  сохранить")
+                            RichText::new("ПРОБЕЛ  новая картинка     S  сохранить")
                                 .size(10.0)
                                 .color(self.muted()),
                         );
@@ -1409,13 +1531,15 @@ impl eframe::App for GalleryApp {
             .frame(egui::Frame::new().fill(self.background()).inner_margin(22))
             .show(ctx, |ui| {
                 self.header(ui, ctx);
-                if self.view == View::Discover {
-                    self.viewer(ui);
-                } else {
-                    self.collection(ui);
+                match self.view {
+                    View::Discover => self.viewer(ui),
+                    View::Collection => self.collection(ui),
+                    View::Favorites | View::Albums => self.cloud_library(ui),
                 }
             });
         self.settings_window(ctx);
+        self.filters_window(ctx);
+        self.account_window(ctx);
         self.smoke(ctx);
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -1432,6 +1556,8 @@ impl eframe::App for GalleryApp {
         }
     }
 }
+
+include!("cloud_ui.rs");
 
 fn palette(settings: &Settings, appearance: Appearance) -> (bool, [u8; 3]) {
     let dark = match settings.theme {

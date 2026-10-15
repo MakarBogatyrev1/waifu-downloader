@@ -3051,7 +3051,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "waifu-gallery"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "eframe",
  "image",
@@ -3059,6 +3059,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "windows-sys 0.61.2",
  "winreg",
 ]
 

@@ -2,6 +2,7 @@
 mod api;
 mod app;
 mod assets;
+mod cloud;
 mod settings;
 mod system;
 mod worker;

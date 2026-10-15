@@ -13,7 +13,7 @@ pub struct Query {
     pub tag: String,
     pub custom_url: Option<String>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Metadata {
     pub key: String,
     pub source: Option<String>,
@@ -108,6 +108,10 @@ impl Api {
             }
         }
         Err("Слишком много страниц тегов".into())
+    }
+    pub fn direct(&self, meta: Metadata) -> Result<Download, String> {
+        let bytes = bounded_body(self.get(&meta.key, None, false)?, MAX_BYTES)?;
+        Ok(Download { bytes, meta })
     }
     pub fn image(&self, query: &Query) -> Result<Download, String> {
         let default_url = format!("{}/images", self.base);
