@@ -302,6 +302,16 @@ async fn state(State(s): State<Arc<Service>>, h: HeaderMap) -> Result<Json<Data>
         )
     })?
 }
+fn encoded_state(data: &Data) -> Result<String> {
+    let encoded = serde_json::to_string(data)
+        .map_err(|_| Error(StatusCode::INTERNAL_SERVER_ERROR, "Ошибка записи коллекции"))?;
+    if encoded.len() > 8 * 1024 * 1024 {
+        return Err(bad(
+            "Лимит коллекции: 8 МБ метаданных. Удали ненужные элементы",
+        ));
+    }
+    Ok(encoded)
+}
 async fn operation(
     State(s): State<Arc<Service>>,
     h: HeaderMap,
@@ -315,7 +325,7 @@ async fn operation(
         apply(&mut data, op)?;
         tx.execute(
             "UPDATE users SET data=? WHERE id=?",
-            params![serde_json::to_string(&data).unwrap(), uid],
+            params![encoded_state(&data)?, uid],
         )?;
         tx.commit()?;
         Ok(Json(data))
@@ -410,6 +420,18 @@ mod tests {
         apply(&mut d, Operation::FavoriteRemove { key: k }).unwrap();
         assert!(d.favorites.is_empty());
         assert!(d.albums[0].items.is_empty());
+    }
+    #[test]
+    fn total_metadata_is_bounded() {
+        let mut data = Data::default();
+        data.albums.push(Album {
+            id: "test".into(),
+            name: "test".into(),
+            items: vec!["x".repeat(8 * 1024 * 1024)],
+        });
+        assert!(encoded_state(&data).is_err());
+        data.albums.clear();
+        assert!(encoded_state(&data).is_ok());
     }
     #[test]
     fn missing_album_cannot_receive_items() {
