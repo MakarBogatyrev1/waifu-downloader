@@ -1,7 +1,8 @@
 import os
 import json
-import io
-import requests
+import queue
+import threading
+from waifu_client import WaifuClient
 from pathlib import Path
 from PIL import Image, ImageTk
 from customtkinter import CTkImage
@@ -25,7 +26,7 @@ class SettingsManager:
         self.color_theme = "dark-blue"
 
         self.mode = "SFW"  # "SFW" or "NSFW"
-        self.category = "neko"
+        self.category = "waifu"
 
         # saving: A / B / C (как ты хотел)
         # A — по умолчанию структура (mode/category)
@@ -128,6 +129,10 @@ class SettingsManager:
         в зависимости от load_saved_mode.
         """
         folders = []
+        if self.save_mode == "B":
+            folders.append(self.images_dir)
+        elif self.save_mode == "C" and self.custom_save_folder:
+            folders.append(Path(self.custom_save_folder))
 
         if self.load_saved_mode == 1:
             # только текущая категория
@@ -146,6 +151,7 @@ class SettingsManager:
         elif self.load_saved_mode == 3:
             # все папки, где есть изображения
             if self.images_dir.exists():
+                folders.append(self.images_dir)
                 for p in self.images_dir.rglob("*"):
                     if p.is_dir():
                         folders.append(p)
@@ -193,7 +199,7 @@ class GalleryManager:
 
         img = pil_image.copy()
         img.thumbnail((self.settings.max_width, self.settings.max_height), Image.LANCZOS)
-        self.current_image = img
+        self.current_image = pil_image
         self.current_image_tk = CTkImage(light_image=img, dark_image=img, size=img.size)
         self.current_large_label.configure(image=self.current_image_tk, text="")
 
@@ -568,22 +574,21 @@ class SettingsWindow(ctk.CTkToplevel):
 # ==============================
 
 class App(ctk.CTk):
-    SFW_CATEGORIES = [
-        "waifu", "neko", "shinobu", "megumin",
-        "hug", "kiss", "pat", "smile", "wave",
-        "highfive", "handhold", "nom", "bite",
-        "slap", "wink", "dance", "cringe"
-    ]
-
-    NSFW_CATEGORIES = [
-        "waifu", "neko", "trap", "blowjob"
-    ]
+    DEFAULT_TAGS = ["waifu"]
 
     def __init__(self):
         super().__init__()
 
         # settings
         self.settings = SettingsManager()
+        self.client = WaifuClient()
+        self.tags = list(self.DEFAULT_TAGS)
+        # Keep the old category until the API confirms whether it is valid.
+        self._saved_category = self.settings.category
+        self._events = queue.Queue()
+        self._loading = False
+        self._closed = False
+        self._generation = 0
         ctk.set_appearance_mode(self.settings.appearance_mode)  # "dark"
         ctk.set_default_color_theme(self.settings.color_theme)  # "dark-blue"
 
@@ -603,6 +608,9 @@ class App(ctk.CTk):
 
         # загружаем сохранённые изображения
         self.gallery.reload_saved_images()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._poll_id = self.after(50, self._poll_events)
+        self._start_worker("tags", self.client.tags)
 
     # --------------- UI ---------------
 
@@ -622,7 +630,7 @@ class App(ctk.CTk):
         self.mode_menu.pack(side="left", padx=(4, 4))
 
         # Category OptionMenu
-        self.var_category = ctk.StringVar(value=self.settings.category)
+        self.var_category = ctk.StringVar(value="waifu")
         self.category_menu = ctk.CTkOptionMenu(
             top_frame,
             values=self._get_categories_for_mode(self.settings.mode),
@@ -665,13 +673,12 @@ class App(ctk.CTk):
     # --------------- helpers ---------------
 
     def _get_categories_for_mode(self, mode: str):
-        if mode == "NSFW":
-            return self.NSFW_CATEGORIES
-        return self.SFW_CATEGORIES
+        return self.tags
 
     def _apply_initial_settings(self):
         # применяем сохранённые режим и категорию (если валидны)
         mode = self.settings.mode if self.settings.mode in ["SFW", "NSFW"] else "SFW"
+        self.settings.mode = mode
         self.var_mode.set(mode)
 
         categories = self._get_categories_for_mode(mode)
@@ -687,6 +694,7 @@ class App(ctk.CTk):
     # --------------- event handlers ---------------
 
     def on_mode_change(self, value):
+        self._generation += 1
         self.settings.mode = value
 
         # обновляем категории
@@ -704,51 +712,78 @@ class App(ctk.CTk):
         self.set_status(f"Режим: {self.settings.mode}, категория: {self.settings.category}")
 
     def on_category_change(self, value):
+        self._generation += 1
+        self._saved_category = value
         self.settings.category = value
         self.settings.save_settings()
         # при смене категории можно перезагрузить сохранённые (зависит от настроек)
         self.gallery.reload_saved_images()
         self.set_status(f"Режим: {self.settings.mode}, категория: {self.settings.category}")
 
-    def on_next(self):
-        """
-        Загрузить следующее изображение:
-        - если включён кастомный URL — используем его
-        - иначе waifu.pics (sfw/nsfw + category)
-        """
+    def _start_worker(self, kind, operation, generation=None):
+        events = self._events
+
+        def work():
+            try:
+                events.put((kind, generation, operation(), None))
+            except Exception as error:
+                events.put((kind, generation, None, str(error)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll_events(self):
+        if self._closed:
+            return
         try:
-            if self.settings.use_custom_url and self.settings.custom_url:
-                url = self.settings.custom_url
-            else:
-                base = "https://api.waifu.pics"
-                mode = "sfw" if self.settings.mode == "SFW" else "nsfw"
-                category = self.settings.category
-                url = f"{base}/{mode}/{category}"
+            while True:
+                kind, generation, result, error = self._events.get_nowait()
+                if kind == "tags":
+                    if error:
+                        self.set_status(f"Не удалось загрузить теги: {error}. Доступен тег waifu.")
+                    else:
+                        self.tags = result
+                        candidate = self._saved_category
+                        self.settings.category = (candidate if candidate in result else
+                                                  "waifu" if "waifu" in result else result[0])
+                        self.var_category.set(self.settings.category)
+                        self.category_menu.configure(values=result)
+                        self._generation += 1
+                        self.settings.save_settings()
+                        self.gallery.reload_saved_images()
+                        self.set_status("Теги Waifu.im загружены")
+                elif kind == "image":
+                    self._loading = False
+                    self.btn_next.configure(state="normal")
+                    if generation != self._generation:
+                        self.set_status("Параметры изменились. Нажмите «Следующая» для новой загрузки.")
+                    elif error:
+                        self.set_status(f"Ошибка загрузки: {error}")
+                    else:
+                        self.gallery.add_new_image(result)
+                        self.set_status("Изображение загружено")
+        except queue.Empty:
+            pass
+        self._poll_id = self.after(50, self._poll_events)
 
-            self.set_status("Загрузка изображения...")
-            self.update_idletasks()
+    def on_next(self):
+        if self._loading or self._closed:
+            return
+        mode, tag = self.settings.mode, self.settings.category
+        custom_url = (self.settings.custom_url.strip()
+                      if self.settings.use_custom_url else None)
+        if self.settings.use_custom_url and not custom_url:
+            self.set_status("Укажите пользовательский URL в настройках")
+            return
+        self._loading = True
+        self.btn_next.configure(state="disabled")
+        self.set_status("Загрузка изображения...")
+        self._start_worker("image", lambda: self.client.image(mode, tag, custom_url),
+                           self._generation)
 
-            resp = requests.get(url, timeout=15)
-            resp.raise_for_status()
-
-            data = resp.json()
-            # для waifu.pics поле "url" содержит ссылку на картинку
-            img_url = data.get("url")
-            if not img_url:
-                raise ValueError("Не удалось получить url изображения")
-
-            img_resp = requests.get(img_url, timeout=30)
-            img_resp.raise_for_status()
-
-            img_bytes = io.BytesIO(img_resp.content)
-            pil_img = Image.open(img_bytes).convert("RGBA")
-
-            # добавляем в "новые"
-            self.gallery.add_new_image(pil_img)
-
-            self.set_status("Изображение загружено")
-        except Exception as e:
-            self.set_status(f"Ошибка загрузки: {e}")
+    def on_close(self):
+        self._closed = True
+        for callback in self.tk.splitlist(self.tk.call("after", "info")):
+            self.after_cancel(callback)
+        self.destroy()
 
     def on_save(self):
         ok, msg = self.gallery.save_current_image()
@@ -760,6 +795,7 @@ class App(ctk.CTk):
 
     def on_settings_closed(self, apply_changes: bool):
         if apply_changes:
+            self._generation += 1
             # пересобираем галерею, т.к. изменились режимы загрузки и отображения
             self.gallery.reload_saved_images()
             self.set_status("Настройки применены")
