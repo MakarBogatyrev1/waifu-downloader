@@ -16,6 +16,7 @@ use std::{
 pub enum NetJob {
     Tags,
     Image(u64, Query),
+    Direct(u64, Metadata),
 }
 pub enum DiskJob {
     Open(u64, Source, Metadata),
@@ -27,6 +28,7 @@ pub enum DiskJob {
     Flush(Sender<()>),
 }
 pub enum Event {
+    RemoteThumb(String, Result<ColorImage, String>),
     Tags(Result<Vec<String>, String>),
     Image(u64, Result<Box<Loaded>, String>),
     Open(u64, Result<Box<Loaded>, String>),
@@ -37,6 +39,7 @@ pub enum Event {
     Appearance(system::Appearance),
 }
 pub struct Workers {
+    pub remote_thumbs: SyncSender<Metadata>,
     pub net: SyncSender<NetJob>,
     pub disk: SyncSender<DiskJob>,
     pub events: Receiver<Event>,
@@ -51,12 +54,34 @@ impl Workers {
         let (tx, events) = mpsc::channel();
         let (net_tx, net_rx) = mpsc::sync_channel(2);
         let (disk_tx, disk_rx) = mpsc::sync_channel(24);
+        let (thumb_tx, thumb_rx) = mpsc::sync_channel::<Metadata>(1);
+        let thumb_events = tx.clone();
+        let thumb_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let api = Api::new();
+            while let Ok(meta) = thumb_rx.recv() {
+                let key = meta.key.clone();
+                let result = api.as_ref().map_err(Clone::clone).and_then(|a| {
+                    let d = a.direct(meta)?;
+                    assets::load(Source::Memory(Arc::new(d.bytes)), d.meta)
+                        .map(|loaded| loaded.thumbnail)
+                });
+                emit(&thumb_events, &thumb_ctx, Event::RemoteThumb(key, result));
+            }
+        });
         let nt = tx.clone();
         let nc = ctx.clone();
         std::thread::spawn(move || {
             let api = Api::new();
             while let Ok(job) = net_rx.recv() {
                 let event = match job {
+                    NetJob::Direct(epoch, meta) => Event::Open(
+                        epoch,
+                        api.as_ref().map_err(Clone::clone).and_then(|api| {
+                            let d = api.direct(meta)?;
+                            assets::load(Source::Memory(Arc::new(d.bytes)), d.meta).map(Box::new)
+                        }),
+                    ),
                     NetJob::Tags => {
                         Event::Tags(api.as_ref().map_err(Clone::clone).and_then(Api::tags))
                     }
@@ -93,6 +118,7 @@ impl Workers {
             }
         });
         Self {
+            remote_thumbs: thumb_tx,
             net: net_tx,
             disk: disk_tx,
             events,

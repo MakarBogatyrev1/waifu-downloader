@@ -27,6 +27,7 @@ pub struct Settings {
     pub accent: [u8; 3],
     pub system_accent: bool,
     pub prefetch: bool,
+    pub sync_server: String,
 }
 
 impl Default for Settings {
@@ -43,6 +44,7 @@ impl Default for Settings {
             accent: [159, 123, 255],
             system_accent: true,
             prefetch: true,
+            sync_server: "https://waifudownload.hopto.org".into(),
         }
     }
 }
