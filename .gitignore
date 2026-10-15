@@ -1,5 +1,4 @@
-__pycache__/
-*.py[cod]
-.venv/
+/target/
 settings.json
+settings-rust.json
 images/
