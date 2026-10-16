@@ -109,6 +109,7 @@ impl GalleryApp {
                                     .corner_radius(16)
                                     .inner_margin(10)
                                     .show(ui, |ui| {
+                                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                                         ui.set_width((width - 20.0).max(100.0));
                                         let texture = match entry {
                                             GalleryEntry::Local(path) => {
@@ -149,7 +150,7 @@ impl GalleryApp {
                                             }
                                         };
                                         let (rect, response) = ui.allocate_exact_size(
-                                            egui::vec2(ui.available_width(), image_height),
+                                            egui::vec2((width - 20.0).max(100.0), image_height),
                                             egui::Sense::click(),
                                         );
                                         ui.painter().rect_filled(rect, 10, self.card());
@@ -245,6 +246,7 @@ impl GalleryApp {
                                                     });
                                                 },
                                             );
+                                        });
                                         });
                                     });
                             });
