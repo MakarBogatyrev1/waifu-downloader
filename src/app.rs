@@ -1,3 +1,4 @@
+use crate::icons::{self, Icon};
 use crate::{
     api::{Metadata, Query},
     assets::{self, Loaded, Source},
@@ -621,13 +622,11 @@ impl GalleryApp {
         let [r, g, b] = system::contrast_text(self.accent());
         ui.add_enabled(
             enabled,
-            egui::Button::new(
-                RichText::new(text)
-                    .color(Color32::from_rgb(r, g, b))
-                    .strong(),
-            )
-            .fill(self.ac())
-            .min_size(egui::vec2(158.0, 42.0)),
+            icons::button(text, icons::for_label(text))
+                .color(Color32::from_rgb(r, g, b))
+                .strong()
+                .fill(self.ac())
+                .min_size(egui::vec2(176.0, 42.0)),
         )
     }
     fn sidebar(&mut self, ctx: &egui::Context) {
@@ -659,7 +658,17 @@ impl GalleryApp {
                     if ui
                         .add_sized(
                             [ui.available_width(), 44.0],
-                            egui::Button::new(RichText::new(label).strong()).fill(if active {
+                            icons::button(
+                                label,
+                                match view {
+                                    View::Discover => Icon::Image,
+                                    View::Collection => Icon::Collection,
+                                    View::Favorites => Icon::Heart,
+                                    View::Albums => Icon::Folder,
+                                },
+                            )
+                            .strong()
+                            .fill(if active {
                                 self.ac().gamma_multiply(0.22)
                             } else {
                                 Color32::TRANSPARENT
@@ -679,14 +688,20 @@ impl GalleryApp {
                     );
                     ui.add_space(12.0);
                     if ui
-                        .add_sized([ui.available_width(), 38.0], egui::Button::new("Настройки"))
+                        .add_sized(
+                            [ui.available_width(), 38.0],
+                            icons::button("Настройки", Icon::Settings),
+                        )
                         .clicked()
                     {
                         self.settings_open = true;
                     }
                     let label = self.cloud_user.as_deref().unwrap_or("Войти в аккаунт");
                     if ui
-                        .add_sized([ui.available_width(), 42.0], egui::Button::new(label))
+                        .add_sized(
+                            [ui.available_width(), 42.0],
+                            icons::button(label, Icon::User),
+                        )
                         .clicked()
                     {
                         self.account_open = true;
@@ -768,7 +783,8 @@ impl GalleryApp {
                     if ui
                         .add_enabled(
                             enabled,
-                            egui::Button::new(label).min_size(egui::vec2(110.0, 42.0)),
+                            icons::button(label, icons::for_label(label))
+                                .min_size(egui::vec2(130.0, 42.0)),
                         )
                         .clicked()
                     {
@@ -791,11 +807,18 @@ impl GalleryApp {
                         if ui
                             .add_enabled(
                                 local || !self.cloud_busy,
-                                egui::Button::new(if favorite {
-                                    "В избранном"
-                                } else {
-                                    "В избранное"
-                                })
+                                icons::button(
+                                    if favorite {
+                                        "В избранном"
+                                    } else {
+                                        "В избранное"
+                                    },
+                                    if favorite {
+                                        Icon::HeartFilled
+                                    } else {
+                                        Icon::Heart
+                                    },
+                                )
                                 .min_size(egui::vec2(110.0, 42.0)),
                             )
                             .clicked()
@@ -818,12 +841,15 @@ impl GalleryApp {
                         }
                     }
                 } else if self.view == View::Collection {
-                    if ui.button("Обновить").clicked() {
+                    if ui.add(icons::button("Обновить", Icon::Refresh)).clicked() {
                         self.scan();
                     }
                 } else if self.cloud_user.is_some()
                     && ui
-                        .add_enabled(!self.cloud_busy, egui::Button::new("Синхронизировать"))
+                        .add_enabled(
+                            !self.cloud_busy,
+                            icons::button("Синхронизировать", Icon::Refresh),
+                        )
                         .clicked()
                 {
                     self.cloud_send(CloudJob::Refresh);

@@ -3,6 +3,7 @@ mod api;
 mod app;
 mod assets;
 mod cloud;
+mod icons;
 mod install;
 mod settings;
 mod system;
@@ -83,7 +84,17 @@ fn main() -> eframe::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 880.0])
             .with_min_inner_size([1040.0, 760.0])
-            .with_title("Waifu Gallery"),
+            .with_title("Waifu Gallery")
+            .with_icon({
+                let image = image::load_from_memory(include_bytes!("../assets/icon.png"))
+                    .expect("embedded app icon")
+                    .into_rgba8();
+                eframe::egui::IconData {
+                    width: image.width(),
+                    height: image.height(),
+                    rgba: image.into_raw(),
+                }
+            }),
         ..Default::default()
     };
     eframe::run_native(

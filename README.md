@@ -1,7 +1,10 @@
-# Waifu Gallery 2.2 · Rust
+# Waifu Gallery 2.2.1 · Rust
 
 Нативная галерея для Windows с Waifu.im v7. Интерфейс на egui/eframe, графика
 через OpenGL, сеть через reqwest и rustls. Python для запуска не нужен.
+
+Иконки навигации и действий нарисованы векторами. Собственная иконка Waifu Gallery
+встроена в окно, панель задач, EXE и установщик Windows (ICO 16–256 px).
 
 ## Установка в Windows
 
