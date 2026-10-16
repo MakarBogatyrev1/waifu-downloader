@@ -33,6 +33,12 @@ enum View {
 
 pub struct GalleryApp {
     base: PathBuf,
+    updates: crate::updater::Updater,
+    update_ready: Option<crate::updater::Ready>,
+    update_busy: bool,
+    update_status: String,
+    update_restart: bool,
+    install_after_exit: bool,
     settings: Settings,
     workers: Workers,
     appearance: Appearance,
@@ -107,8 +113,15 @@ impl GalleryApp {
         let _ = cloud
             .tx
             .try_send(CloudJob::Resume(settings.sync_server.clone()));
+        let updates = crate::updater::Updater::start(cc.egui_ctx.clone());
         let mut app = Self {
             base,
+            updates,
+            update_ready: None,
+            update_busy: false,
+            update_status: "Обновления из GitHub Releases".into(),
+            update_restart: false,
+            install_after_exit: false,
             settings,
             workers,
             appearance: Appearance {
@@ -421,7 +434,11 @@ impl GalleryApp {
         if self
             .workers
             .disk
-            .try_send(DiskJob::Save(key.clone(), item.source.clone(), folder))
+            .try_send(DiskJob::SaveWithMetadata(
+                item.meta.clone(),
+                item.source.clone(),
+                folder,
+            ))
             .is_ok()
         {
             self.saving.insert(key);
@@ -759,12 +776,21 @@ impl GalleryApp {
                     }
                     let meta = self.selected.map(|i| self.history[i].meta.clone());
                     if let Some(meta) = meta {
-                        let favorite = self.cloud_data.favorites.iter().any(|p| p.key == meta.key);
+                        let local =
+                            !(meta.key.starts_with("http://") || meta.key.starts_with("https://"));
+                        let path = match &self.history[self.selected.unwrap()].source {
+                            Source::Disk(p) => Some(p.clone()),
+                            _ => None,
+                        };
+                        let favorite = if local {
+                            path.as_ref()
+                                .is_some_and(|p| self.settings.local_favorites.contains(p))
+                        } else {
+                            self.cloud_data.favorites.iter().any(|p| p.key == meta.key)
+                        };
                         if ui
                             .add_enabled(
-                                !self.cloud_busy
-                                    && (meta.key.starts_with("https://")
-                                        || meta.key.starts_with("http://")),
+                                local || !self.cloud_busy,
                                 egui::Button::new(if favorite {
                                     "В избранном"
                                 } else {
@@ -774,7 +800,11 @@ impl GalleryApp {
                             )
                             .clicked()
                         {
-                            if self.cloud_user.is_none() {
+                            if local {
+                                if let Some(path) = path {
+                                    self.toggle_local_favorite(path);
+                                }
+                            } else if self.cloud_user.is_none() {
                                 self.account_open = true;
                             } else if favorite {
                                 self.cloud_send(CloudJob::Op(
@@ -1256,6 +1286,7 @@ impl GalleryApp {
                             ui.label(RichText::new("Загрузка и управление").size(24.0).strong());ui.add_space(16.0);
                             ui.checkbox(&mut self.settings.prefetch,"Предзагружать следующую картинку");ui.small("Следующая картинка будет готова быстрее. Расходует трафик.");
                             ui.add_space(14.0);ui.collapsing("Пользовательский источник",|ui|{ui.checkbox(&mut self.settings.use_custom_url,"Использовать свой API");ui.add_enabled(self.settings.use_custom_url,egui::TextEdit::singleline(&mut self.settings.custom_url).hint_text("https://…").desired_width(f32::INFINITY));ui.small("JSON с items[0].url или url. Категории задаются в URL.");});
+                            ui.add_space(18.0);self.update_settings_ui(ui,ctx);
                             ui.add_space(18.0);ui.strong("Горячие клавиши");ui.label("Пробел / N — новая картинка\nS — сохранить\n← / → — история\nCtrl+, — настройки");
                         }
                     }
@@ -1281,6 +1312,16 @@ impl GalleryApp {
         }
     }
     fn housekeeping(&mut self, ctx: &egui::Context) {
+        self.update_events();
+        if !self.smoke
+            && self.settings.auto_update
+            && self.started.elapsed() > Duration::from_secs(3)
+            && !self.update_busy
+            && self.update_ready.is_none()
+            && crate::updater::now().saturating_sub(self.settings.update_last_check) > 43200
+        {
+            self.check_updates();
+        }
         if self.cloud_user.is_some() && !self.cloud_busy {
             if self.pending_appearance.is_some() && Instant::now() >= self.appearance_retry {
                 let a = self.pending_appearance.clone().unwrap();
@@ -1443,7 +1484,9 @@ impl GalleryApp {
                 let path = self.smoke_path.as_ref().unwrap();
                 let ok = image::image_dimensions(path)
                     .is_ok_and(|d| d == (item.dimensions[0], item.dimensions[1]))
-                    && self.library.contains(path);
+                    && self.library.contains(path)
+                    && item.meta.key.starts_with("http")
+                    && path.with_extension("waifu.json").is_file();
                 let _ = std::fs::write(
                     self.base.join("smoke-result.txt"),
                     format!(
@@ -1531,6 +1574,7 @@ impl eframe::App for GalleryApp {
             .frame(egui::Frame::new().fill(self.background()).inner_margin(22))
             .show(ctx, |ui| {
                 self.header(ui, ctx);
+                self.update_banner(ui, ctx);
                 match self.view {
                     View::Discover => self.viewer(ui),
                     View::Collection => self.collection(ui),
@@ -1554,10 +1598,25 @@ impl eframe::App for GalleryApp {
         {
             let _ = rx.recv_timeout(Duration::from_secs(30));
         }
+        if self.install_after_exit {
+            if let Ok(exe) = std::env::current_exe() {
+                let mut cmd = std::process::Command::new(exe);
+                cmd.arg("--install");
+                crate::install::hidden(&mut cmd);
+                let _ = cmd.spawn();
+            }
+        } else if self.settings.auto_update || self.update_restart {
+            if let Some(ready) = &self.update_ready {
+                if let Err(e) = crate::updater::schedule(ready, &self.base, self.update_restart) {
+                    let _ = std::fs::write(self.base.join("update-error.txt"), e);
+                }
+            }
+        }
     }
 }
 
 include!("cloud_ui.rs");
+include!("update_ui.rs");
 
 fn palette(settings: &Settings, appearance: Appearance) -> (bool, [u8; 3]) {
     let dark = match settings.theme {

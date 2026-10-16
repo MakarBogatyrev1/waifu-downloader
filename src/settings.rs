@@ -28,6 +28,9 @@ pub struct Settings {
     pub system_accent: bool,
     pub prefetch: bool,
     pub sync_server: String,
+    pub local_favorites: Vec<PathBuf>,
+    pub auto_update: bool,
+    pub update_last_check: u64,
 }
 
 impl Default for Settings {
@@ -45,6 +48,9 @@ impl Default for Settings {
             system_accent: true,
             prefetch: true,
             sync_server: "https://waifudownload.hopto.org".into(),
+            local_favorites: vec![],
+            auto_update: true,
+            update_last_check: 0,
         }
     }
 }
@@ -201,6 +207,7 @@ mod tests {
         assert_eq!(s.category, "maid");
         assert_eq!(s.save_mode, "C");
         assert!(s.use_custom_url);
+        s.local_favorites = vec![base.join("old-image.png")];
         s.theme = Theme::Dark;
         s.accent = [255, 100, 150];
         s.system_accent = false;
@@ -212,6 +219,7 @@ mod tests {
         assert_eq!(s.theme, Theme::System);
         assert_eq!(s.accent, [255, 100, 150]);
         assert!(!s.system_accent);
+        assert_eq!(s.local_favorites, vec![base.join("old-image.png")]);
         fs::remove_file(base.join("settings.json")).unwrap();
         fs::remove_file(base.join("settings-rust.json")).unwrap();
         fs::remove_dir(base).unwrap();

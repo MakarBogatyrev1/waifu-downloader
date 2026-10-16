@@ -22,7 +22,7 @@ pub enum DiskJob {
     Open(u64, Source, Metadata),
     Thumb(PathBuf),
     Scan(u64, Vec<PathBuf>),
-    Save(String, Source, PathBuf),
+    SaveWithMetadata(Metadata, Source, PathBuf),
     Settings(Settings, PathBuf),
     Appearance,
     Flush(Sender<()>),
@@ -99,14 +99,29 @@ impl Workers {
         std::thread::spawn(move || {
             while let Ok(job) = disk_rx.recv() {
                 let event = match job {
-                    DiskJob::Open(epoch, source, meta) => {
+                    DiskJob::SaveWithMetadata(meta, source, folder) => {
+                        let result = assets::save_png(&source, &folder);
+                        if let Ok(path) = &result {
+                            if let Err(e) = assets::save_metadata(path, &meta) {
+                                emit(
+                                    &tx,
+                                    &ctx,
+                                    Event::Settings(Err(format!(
+                                        "Исходная ссылка не сохранена: {e}"
+                                    ))),
+                                );
+                            }
+                        }
+                        Event::Saved(meta.key, result)
+                    }
+                    DiskJob::Open(epoch, source, mut meta) => {
+                        if let Source::Disk(path) = &source {
+                            meta = assets::disk_metadata(path);
+                        }
                         Event::Open(epoch, assets::load(source, meta).map(Box::new))
                     }
                     DiskJob::Thumb(path) => Event::Thumb(path.clone(), assets::thumbnail(&path)),
                     DiskJob::Scan(epoch, roots) => Event::Scan(epoch, assets::scan(roots)),
-                    DiskJob::Save(key, source, folder) => {
-                        Event::Saved(key, assets::save_png(&source, &folder))
-                    }
                     DiskJob::Settings(settings, base) => Event::Settings(settings.save(&base)),
                     DiskJob::Appearance => Event::Appearance(system::read()),
                     DiskJob::Flush(done) => {
@@ -147,8 +162,14 @@ mod tests {
         let workers = Workers::start(Context::default());
         workers
             .disk
-            .send(DiskJob::Save(
-                "key".into(),
+            .send(DiskJob::SaveWithMetadata(
+                Metadata {
+                    key: "https://example.com/key.png".into(),
+                    source: None,
+                    artist: String::new(),
+                    mode: "SFW".into(),
+                    tag: "waifu".into(),
+                },
                 Source::Memory(Arc::new(encoded.into_inner())),
                 folder.clone(),
             ))
@@ -159,7 +180,14 @@ mod tests {
         let paths = assets::scan(vec![folder.clone()]).unwrap();
         assert_eq!(paths.len(), 1);
         assert_eq!(image::image_dimensions(&paths[0]).unwrap(), (240, 160));
-        assert!(matches!(workers.events.try_recv().unwrap(),Event::Saved(key,Ok(_)) if key=="key"));
+        assert!(
+            matches!(workers.events.try_recv().unwrap(),Event::Saved(key,Ok(_)) if key=="https://example.com/key.png")
+        );
+        assert_eq!(
+            assets::disk_metadata(&paths[0]).key,
+            "https://example.com/key.png"
+        );
+        std::fs::remove_file(paths[0].with_extension("waifu.json")).unwrap();
         std::fs::remove_file(&paths[0]).unwrap();
         std::fs::remove_dir(folder).unwrap();
     }

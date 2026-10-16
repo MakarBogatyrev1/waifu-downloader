@@ -158,7 +158,23 @@ pub fn scan(roots: Vec<PathBuf>) -> Result<Vec<PathBuf>, String> {
     found.truncate(2000);
     Ok(found.into_iter().map(|(_, p)| p).collect())
 }
+pub fn save_metadata(path: &Path, meta: &Metadata) -> Result<(), String> {
+    let bytes = serde_json::to_vec(meta).map_err(|e| e.to_string())?;
+    let sidecar = path.with_extension("waifu.json");
+    fs::write(sidecar, bytes).map_err(|e| e.to_string())
+}
 pub fn disk_metadata(path: &Path) -> Metadata {
+    if let Ok(file) = fs::File::open(path.with_extension("waifu.json")) {
+        if file.metadata().is_ok_and(|s| s.len() <= 16384) {
+            if let Ok(meta) = serde_json::from_reader::<_, Metadata>(file.take(16385)) {
+                if reqwest::Url::parse(&meta.key)
+                    .is_ok_and(|u| ["http", "https"].contains(&u.scheme()))
+                {
+                    return meta;
+                }
+            }
+        }
+    }
     let mode = if path.components().any(|c| c.as_os_str() == "nsfw") {
         "NSFW"
     } else {
@@ -205,6 +221,32 @@ mod tests {
         fs::remove_file(a).unwrap();
         fs::remove_file(b).unwrap();
         fs::remove_dir(folder).unwrap();
+    }
+    #[test]
+    fn saved_image_keeps_source_after_reopening() {
+        let dir = std::env::temp_dir().join(format!(
+            "waifu-meta-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("image.png");
+        let meta = Metadata {
+            key: "https://cdn.waifu.im/test.jpg".into(),
+            source: Some("https://example.com/art".into()),
+            artist: "Artist".into(),
+            mode: "SFW".into(),
+            tag: "maid".into(),
+        };
+        save_metadata(&path, &meta).unwrap();
+        let restored = disk_metadata(&path);
+        assert_eq!(restored.key, meta.key);
+        assert_eq!(restored.artist, "Artist");
+        assert_eq!(restored.tag, "maid");
+        fs::remove_file(path.with_extension("waifu.json")).unwrap();
+        fs::remove_dir(dir).unwrap();
     }
     #[test]
     fn corrupt_data_is_reported() {
