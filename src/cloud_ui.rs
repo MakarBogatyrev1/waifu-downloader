@@ -121,34 +121,10 @@ impl GalleryApp {
         });
         self.account_open = open;
     }
-    fn open_cloud_picture(&mut self, meta: Metadata) {
-        if self.opening {
-            return;
-        }
-        self.waiting = false;
-        self.open_epoch += 1;
-        if self
-            .workers
-            .net
-            .try_send(NetJob::Direct(self.open_epoch, meta))
-            .is_ok()
-        {
-            self.view = View::Discover;
-            self.selected = None;
-            self.preview = None;
-            self.opening = true;
-        } else {
-            self.message("Завершается загрузка. Повтори открытие через секунду", true);
-        }
-    }
     fn cloud_library(&mut self, ui: &mut egui::Ui) {
-        if self.view == View::Favorites {
-            self.local_favorites_ui(ui);
-            if self.cloud_user.is_none() && !self.settings.local_favorites.is_empty() {
-                return;
-            }
-        }
-        if self.cloud_user.is_none() {
+        if self.cloud_user.is_none()
+            && !(self.view == View::Favorites && !self.settings.local_favorites.is_empty())
+        {
             ui.add_space(100.0);
             ui.vertical_centered(|ui| {
                 ui.label(
@@ -232,60 +208,58 @@ impl GalleryApp {
                 return;
             }
         }
-        let membership: HashSet<String> = self
+        ui.add_space(12.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.gallery_search)
+                    .hint_text("Поиск по автору или категории…")
+                    .desired_width(260.0),
+            );
+            ui.add(
+                egui::Slider::new(&mut self.gallery_tile_width, 160.0..=320.0)
+                    .text("Размер")
+                    .show_value(false),
+            );
+        });
+        ui.add_space(12.0);
+        let membership: HashSet<_> = self
             .album_selected
             .as_ref()
             .and_then(|id| self.cloud_data.albums.iter().find(|a| &a.id == id))
             .map(|a| a.items.iter().cloned().collect())
             .unwrap_or_default();
-        let pictures: Vec<usize> = self
+        let mut entries: Vec<_> = self
             .cloud_data
             .favorites
             .iter()
-            .enumerate()
             .rev()
-            .filter(|(_, p)| self.view != View::Albums || membership.contains(&p.key))
-            .map(|(i, _)| i)
+            .filter(|p| self.view != View::Albums || membership.contains(&p.key))
+            .cloned()
+            .map(GalleryEntry::Remote)
             .collect();
-        ui.add_space(14.0);
-        if pictures.is_empty() {
-            ui.add_space(40.0);
-            ui.label("Здесь пока пусто. Открой картинку и нажми «В избранное».");
-            return;
+        if self.view == View::Favorites {
+            entries.extend(
+                self.settings
+                    .local_favorites
+                    .iter()
+                    .rev()
+                    .cloned()
+                    .map(GalleryEntry::Local),
+            );
         }
-        let albums = self.cloud_data.albums.clone();
-        let in_album = self.view == View::Albums;
-        let album_id = self.album_selected.clone();
-        egui::ScrollArea::vertical().show_rows(ui,100.0,pictures.len(),|ui,range|{
-            for i in range{
-                let p=self.cloud_data.favorites[pictures[i]].clone();
-                egui::Frame::new().fill(self.panel()).corner_radius(12).inner_margin(12).show(ui,|ui|{
-                    ui.set_min_width(ui.available_width());ui.horizontal(|ui|{
-                        let texture=self.history.iter().find(|h|h.meta.key==p.key).map(|h|h.thumb.clone()).or_else(||self.remote_thumbs.get(&p.key).cloned());
-                        let (rect,clicked)=ui.allocate_exact_size(egui::vec2(80.0,72.0),egui::Sense::click());
-                        ui.painter().rect_filled(rect,8,self.card());
-                        if let Some(texture)=texture{
-                            let source=texture.size_vec2();let fit=(rect.width()/source.x).min(rect.height()/source.y);let target=egui::Rect::from_center_size(rect.center(),source*fit);
-                            ui.painter().image(texture.id(),target,egui::Rect::from_min_max(egui::Pos2::ZERO,egui::pos2(1.0,1.0)),Color32::WHITE);
-                        }else{
-                            if !self.remote_pending.contains(&p.key)&&!self.remote_failed.contains(&p.key)&&self.workers.remote_thumbs.try_send(p.clone()).is_ok(){self.remote_pending.insert(p.key.clone());}
-                            ui.painter().text(rect.center(),egui::Align2::CENTER_CENTER,"W",egui::FontId::proportional(24.0),self.ac_text());
-                        }
-                        if clicked.on_hover_cursor(egui::CursorIcon::PointingHand).clicked(){self.open_cloud_picture(p.clone());}
-                        ui.vertical(|ui|{ui.strong(if p.artist.is_empty(){tag_label(&p.tag)}else{p.artist.clone()});ui.small(format!("{} · {}",tag_label(&p.tag),if p.mode=="NSFW"{"18+"}else{"Обычные"}));
-                            ui.horizontal_wrapped(|ui|{
-                                if ui.button("Открыть").clicked(){self.open_cloud_picture(p.clone());}
-                                ui.add_enabled_ui(!self.cloud_busy,|ui|{
-                                    ui.menu_button("В альбом",|ui|{if albums.is_empty(){ui.label("Сначала создай альбом в разделе «Альбомы»");}for a in &albums{if ui.button(&a.name).clicked(){self.cloud_send(CloudJob::Op(serde_json::json!({"op":"album_add","id":a.id,"key":p.key})));ui.close_menu();}}});
-                                    if in_album{if ui.button("Убрать из альбома").clicked(){self.cloud_send(CloudJob::Op(serde_json::json!({"op":"album_remove","id":album_id,"key":p.key})));}}
-                                    else if ui.button("Убрать из избранного").clicked(){self.cloud_send(CloudJob::Op(serde_json::json!({"op":"favorite_remove","key":p.key})));}
-                                });
-                            });
-                        });
-                    });
-                });ui.add_space(6.0);
-            }
+        let search = self.gallery_search.to_lowercase();
+        entries.retain(|e| match e {
+            GalleryEntry::Local(p) => p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase()
+                .contains(&search),
+            GalleryEntry::Remote(m) => format!("{} {} {}", m.artist, m.tag, tag_label(&m.tag))
+                .to_lowercase()
+                .contains(&search),
         });
+        self.gallery_grid(ui, entries, "favorites-grid");
     }
 }
 fn tag_label(tag: &str) -> String {
@@ -318,45 +292,5 @@ impl GalleryApp {
             self.message("Добавлено в избранное на этом компьютере. У этого старого файла нет исходной ссылки для синхронизации.",false);
         }
         self.changed();
-    }
-    fn local_favorites_ui(&mut self, ui: &mut egui::Ui) {
-        if self.settings.local_favorites.is_empty() {
-            return;
-        }
-        ui.strong("На этом компьютере");
-        ui.small("Старые файлы без исходной ссылки. Они доступны локально.");
-        let paths = self.settings.local_favorites.clone();
-        egui::ScrollArea::vertical()
-            .id_salt("local-favorites")
-            .max_height(if self.cloud_user.is_some() {
-                200.0
-            } else {
-                ui.available_height() - 45.0
-            })
-            .show_rows(ui, 44.0, paths.len(), |ui, range| {
-                for i in range {
-                    let p = &paths[i];
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(
-                                p.is_file(),
-                                egui::Button::new(
-                                    p.file_name().unwrap_or_default().to_string_lossy(),
-                                ),
-                            )
-                            .clicked()
-                        {
-                            self.open_local(p.clone());
-                        }
-                        if !p.is_file() {
-                            ui.small("Файл перемещён или удалён");
-                        }
-                        if ui.small_button("Убрать").clicked() {
-                            self.toggle_local_favorite(p.clone());
-                        }
-                    });
-                }
-            });
-        ui.separator();
     }
 }

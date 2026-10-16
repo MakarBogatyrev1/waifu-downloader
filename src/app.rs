@@ -1,7 +1,8 @@
+use crate::gallery::{Entry as GalleryEntry, Viewer as GalleryViewer};
 use crate::icons::{self, Icon};
 use crate::{
     api::{Metadata, Query},
-    assets::{self, Loaded, Source},
+    assets::{Loaded, Source},
     cloud::{self, Job as CloudJob},
     settings::{Settings, Theme},
     system::{self, Appearance},
@@ -34,6 +35,11 @@ enum View {
 
 pub struct GalleryApp {
     base: PathBuf,
+    lightbox: Option<GalleryViewer>,
+    gallery_epoch: u64,
+    gallery_context: egui::Context,
+    gallery_tile_width: f32,
+    gallery_search: String,
     updates: crate::updater::Updater,
     update_ready: Option<crate::updater::Ready>,
     update_busy: bool,
@@ -117,6 +123,11 @@ impl GalleryApp {
         let updates = crate::updater::Updater::start(cc.egui_ctx.clone());
         let mut app = Self {
             base,
+            gallery_context: cc.egui_ctx.clone(),
+            lightbox: None,
+            gallery_epoch: 0,
+            gallery_tile_width: 220.0,
+            gallery_search: String::new(),
             updates,
             update_ready: None,
             update_busy: false,
@@ -400,25 +411,20 @@ impl GalleryApp {
         }
     }
     fn open_local(&mut self, path: PathBuf) {
-        self.waiting = false;
-        self.open_epoch += 1;
-        if self
-            .workers
-            .disk
-            .try_send(DiskJob::Open(
-                self.open_epoch,
-                Source::Disk(path.clone()),
-                assets::disk_metadata(&path),
-            ))
-            .is_ok()
-        {
-            self.view = View::Discover;
-            self.selected = None;
-            self.preview = None;
-            self.opening = true;
-        } else {
-            self.message("Очередь коллекции занята.", true);
-        }
+        let mut entries: Vec<_> = self
+            .library
+            .iter()
+            .cloned()
+            .map(GalleryEntry::Local)
+            .collect();
+        let index = entries
+            .iter()
+            .position(|e| e.key() == path.to_string_lossy())
+            .unwrap_or_else(|| {
+                entries.push(GalleryEntry::Local(path));
+                entries.len() - 1
+            });
+        self.open_gallery(entries, index);
     }
     fn save_current(&mut self) {
         let Some(index) = self.selected else {
@@ -455,6 +461,9 @@ impl GalleryApp {
     fn events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.workers.events.try_recv() {
             match event {
+                Event::Gallery(epoch, result) => {
+                    self.gallery_result(ctx, epoch, result);
+                }
                 Event::RemoteThumb(key, result) => {
                     self.remote_pending.remove(&key);
                     match result {
@@ -551,6 +560,13 @@ impl GalleryApp {
                     self.saving.remove(&key);
                     match result {
                         Ok(path) => {
+                            if let Some(g) = self.lightbox.as_mut() {
+                                for (_, loaded) in &mut g.cache {
+                                    if loaded.meta.key == key {
+                                        loaded.source = Source::Disk(path.clone());
+                                    }
+                                }
+                            }
                             for item in &mut self.history {
                                 if item.meta.key == key {
                                     item.saved = true;
@@ -1131,38 +1147,30 @@ impl GalleryApp {
         }
     }
     fn collection(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.library_search)
                     .hint_text("Поиск по имени файла…")
-                    .desired_width(300.0),
+                    .desired_width(260.0),
             );
-            if ui.button("Обновить").clicked() {
+            if ui.add(icons::button("Обновить", Icon::Refresh)).clicked() {
                 self.thumbs.clear();
-                self.thumb_order.clear();
                 self.thumb_failed.clear();
                 self.scan();
             }
+            ui.add(
+                egui::Slider::new(&mut self.gallery_tile_width, 160.0..=320.0)
+                    .text("Размер")
+                    .show_value(false),
+            );
+            ui.label(format!("{} фото", self.library.len()));
             if self.scanning {
                 ui.spinner();
             }
-            ui.label(RichText::new(format!("Файлов: {}", self.library.len())).color(self.muted()));
         });
         ui.add_space(12.0);
-        if self.library.is_empty() {
-            ui.add_space(90.0);
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    RichText::new("Здесь будут твои находки")
-                        .size(25.0)
-                        .strong(),
-                );
-                ui.label("Сохрани изображение из обзора — оно появится в коллекции.");
-                ui.label(RichText::new("Папку можно изменить в настройках.").color(self.muted()));
-            });
-            return;
-        }
-        let filtered: Vec<_> = self
+        let search = self.library_search.to_lowercase();
+        let entries = self
             .library
             .iter()
             .filter(|p| {
@@ -1170,111 +1178,13 @@ impl GalleryApp {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_lowercase()
-                    .contains(&self.library_search.to_lowercase())
+                    .contains(&search)
             })
             .cloned()
+            .map(GalleryEntry::Local)
             .collect();
-        let columns = (ui.available_width() / 194.0).floor().max(1.0) as usize;
-        let tile_width = (ui.available_width() - (columns - 1) as f32 * 10.0) / columns as f32;
-        let rows = filtered.len().div_ceil(columns);
-        let mut open = None;
-        egui::ScrollArea::vertical()
-            .id_salt("library")
-            .show_rows(ui, 205.0, rows, |ui, range| {
-                for row in range {
-                    ui.horizontal(|ui| {
-                        for path in filtered.iter().skip(row * columns).take(columns) {
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(tile_width, 203.0),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| {
-                                    egui::Frame::new()
-                                        .fill(self.panel())
-                                        .corner_radius(12)
-                                        .inner_margin(9)
-                                        .show(ui, |ui| {
-                                            ui.set_width((tile_width - 18.0).max(100.0));
-                                            ui.set_height(185.0);
-                                            let (rect, response) = ui.allocate_exact_size(
-                                                egui::vec2(ui.available_width(), 140.0),
-                                                egui::Sense::click(),
-                                            );
-                                            ui.painter().rect_filled(rect, 8, self.card());
-                                            if let Some(texture) = self.thumbs.get(path) {
-                                                let size = texture.size_vec2();
-                                                let scale = (rect.width() / size.x)
-                                                    .min(rect.height() / size.y);
-                                                let image_rect = egui::Rect::from_center_size(
-                                                    rect.center(),
-                                                    size * scale,
-                                                );
-                                                ui.painter().image(
-                                                    texture.id(),
-                                                    image_rect,
-                                                    egui::Rect::from_min_max(
-                                                        egui::pos2(0.0, 0.0),
-                                                        egui::pos2(1.0, 1.0),
-                                                    ),
-                                                    Color32::WHITE,
-                                                );
-                                            } else {
-                                                ui.painter().text(
-                                                    rect.center(),
-                                                    egui::Align2::CENTER_CENTER,
-                                                    if self.thumb_failed.contains(path) {
-                                                        "Не читается"
-                                                    } else {
-                                                        "…"
-                                                    },
-                                                    egui::FontId::proportional(18.0),
-                                                    self.muted(),
-                                                );
-                                                if !self.thumb_failed.contains(path)
-                                                    && !self.thumb_pending.contains(path)
-                                                    && self
-                                                        .workers
-                                                        .disk
-                                                        .try_send(DiskJob::Thumb(path.clone()))
-                                                        .is_ok()
-                                                {
-                                                    self.thumb_pending.insert(path.clone());
-                                                }
-                                            }
-                                            if response
-                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                                .clicked()
-                                            {
-                                                open = Some(path.clone());
-                                            }
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(
-                                                        path.file_name()
-                                                            .unwrap_or_default()
-                                                            .to_string_lossy(),
-                                                    )
-                                                    .size(11.0),
-                                                )
-                                                .truncate(),
-                                            )
-                                            .on_hover_text(path.display().to_string());
-                                            ui.label(
-                                                RichText::new("Открыть изображение")
-                                                    .size(10.0)
-                                                    .color(self.muted()),
-                                            );
-                                        });
-                                },
-                            );
-                        }
-                    });
-                }
-            });
-        if let Some(path) = open {
-            self.open_local(path);
-        }
+        self.gallery_grid(ui, entries, "saved-grid");
     }
-
     fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
             return;
@@ -1425,6 +1335,7 @@ impl GalleryApp {
                 8 => "preview-settings.png",
                 10 => "preview-collection.png",
                 14 => "preview-account.png",
+                17 => "preview-gallery.png",
                 _ => "preview.png",
             };
             let rgba: Vec<u8> = image.pixels.iter().flat_map(|p| p.to_array()).collect();
@@ -1450,6 +1361,9 @@ impl GalleryApp {
                     self.account_open = true;
                     self.capture_after = Instant::now() + Duration::from_millis(400);
                     self.smoke_phase = 13;
+                }
+                17 => {
+                    self.smoke_phase = 18;
                 }
                 14 => {
                     self.account_open = false;
@@ -1505,24 +1419,44 @@ impl GalleryApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
                 self.smoke_phase = 10;
             }
-            11 if !self.opening && self.selected.is_some() => {
-                let item = &self.history[self.selected.unwrap()];
+            11 if self
+                .lightbox
+                .as_ref()
+                .is_some_and(|g| g.loaded().is_some() && !g.busy) =>
+            {
+                self.gallery_step(1);
+                self.smoke_phase = 15;
+            }
+            15 if self
+                .lightbox
+                .as_ref()
+                .is_some_and(|g| g.loaded().is_some() && !g.busy) =>
+            {
+                self.gallery_step(-1);
+                self.smoke_phase = 16;
+            }
+            16 if self
+                .lightbox
+                .as_ref()
+                .is_some_and(|g| g.loaded().is_some() && !g.busy) =>
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+                self.smoke_phase = 17;
+            }
+            18 if self
+                .lightbox
+                .as_ref()
+                .is_some_and(|g| g.loaded().is_some() && !g.busy) =>
+            {
+                let loaded = self.lightbox.as_ref().unwrap().loaded().unwrap();
                 let path = self.smoke_path.as_ref().unwrap();
-                let ok = image::image_dimensions(path)
-                    .is_ok_and(|d| d == (item.dimensions[0], item.dimensions[1]))
-                    && self.library.contains(path)
-                    && item.meta.key.starts_with("http")
-                    && path.with_extension("waifu.json").is_file();
-                let _ = std::fs::write(
-                    self.base.join("smoke-result.txt"),
-                    format!(
-                        "{}: tags={}, dimensions={:?}, saved={}, collection_opened=true",
-                        if ok { "OK" } else { "FAILED" },
-                        self.tags.len(),
-                        item.dimensions,
-                        path.display()
-                    ),
-                );
+                let ok = self.view == View::Collection
+                    && self.history.len() == 1
+                    && matches!(&loaded.source,Source::Disk(p) if p==path)
+                    && image::image_dimensions(path)
+                        .is_ok_and(|d| d == (loaded.dimensions[0], loaded.dimensions[1]))
+                    && loaded.meta.key.starts_with("http");
+                let _=std::fs::write(self.base.join("smoke-result.txt"),format!("{}: gallery_separate=true, next_previous=true, history_len={}, dimensions={:?}",if ok{"OK"}else{"FAILED"},self.history.len(),loaded.dimensions));
                 self.smoke_phase = 12;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -1545,7 +1479,7 @@ impl eframe::App for GalleryApp {
         }
         self.housekeeping(ctx);
         self.apply_style(ctx);
-        if !ctx.wants_keyboard_input() {
+        if self.lightbox.is_none() && !ctx.wants_keyboard_input() {
             if ctx.input(|i| i.key_pressed(egui::Key::Space) || i.key_pressed(egui::Key::N)) {
                 self.next(ctx);
             }
@@ -1561,7 +1495,9 @@ impl eframe::App for GalleryApp {
                 }
             }
         }
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Comma)) {
+        if self.lightbox.is_none()
+            && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Comma))
+        {
             self.settings_open = !self.settings_open;
         }
         self.sidebar(ctx);
@@ -1610,6 +1546,7 @@ impl eframe::App for GalleryApp {
         self.settings_window(ctx);
         self.filters_window(ctx);
         self.account_window(ctx);
+        self.gallery_modal(ctx);
         self.smoke(ctx);
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -1643,6 +1580,7 @@ impl eframe::App for GalleryApp {
 
 include!("cloud_ui.rs");
 include!("update_ui.rs");
+include!("gallery_ui.rs");
 
 fn palette(settings: &Settings, appearance: Appearance) -> (bool, [u8; 3]) {
     let dark = match settings.theme {

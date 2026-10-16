@@ -14,11 +14,12 @@ use std::{
 };
 
 pub enum NetJob {
+    Gallery(u64, Metadata),
     Tags,
     Image(u64, Query),
-    Direct(u64, Metadata),
 }
 pub enum DiskJob {
+    Gallery(u64, PathBuf),
     Open(u64, Source, Metadata),
     Thumb(PathBuf),
     Scan(u64, Vec<PathBuf>),
@@ -28,6 +29,7 @@ pub enum DiskJob {
     Flush(Sender<()>),
 }
 pub enum Event {
+    Gallery(u64, Result<Box<Loaded>, String>),
     RemoteThumb(String, Result<ColorImage, String>),
     Tags(Result<Vec<String>, String>),
     Image(u64, Result<Box<Loaded>, String>),
@@ -75,7 +77,7 @@ impl Workers {
             let api = Api::new();
             while let Ok(job) = net_rx.recv() {
                 let event = match job {
-                    NetJob::Direct(epoch, meta) => Event::Open(
+                    NetJob::Gallery(epoch, meta) => Event::Gallery(
                         epoch,
                         api.as_ref().map_err(Clone::clone).and_then(|api| {
                             let d = api.direct(meta)?;
@@ -99,6 +101,11 @@ impl Workers {
         std::thread::spawn(move || {
             while let Ok(job) = disk_rx.recv() {
                 let event = match job {
+                    DiskJob::Gallery(epoch, path) => Event::Gallery(
+                        epoch,
+                        assets::load(Source::Disk(path.clone()), assets::disk_metadata(&path))
+                            .map(Box::new),
+                    ),
                     DiskJob::SaveWithMetadata(meta, source, folder) => {
                         let result = assets::save_png(&source, &folder);
                         if let Ok(path) = &result {

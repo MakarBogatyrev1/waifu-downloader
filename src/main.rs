@@ -3,6 +3,7 @@ mod api;
 mod app;
 mod assets;
 mod cloud;
+mod gallery;
 mod icons;
 mod install;
 mod settings;
