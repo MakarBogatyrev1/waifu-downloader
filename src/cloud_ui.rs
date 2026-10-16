@@ -142,6 +142,12 @@ impl GalleryApp {
         }
     }
     fn cloud_library(&mut self, ui: &mut egui::Ui) {
+        if self.view == View::Favorites {
+            self.local_favorites_ui(ui);
+            if self.cloud_user.is_none() && !self.settings.local_favorites.is_empty() {
+                return;
+            }
+        }
         if self.cloud_user.is_none() {
             ui.add_space(100.0);
             ui.vertical_centered(|ui| {
@@ -300,4 +306,57 @@ fn tag_label(tag: &str) -> String {
         _ => return tag.replace('-', " "),
     }
     .into()
+}
+
+impl GalleryApp {
+    fn toggle_local_favorite(&mut self, path: PathBuf) {
+        if self.settings.local_favorites.contains(&path) {
+            self.settings.local_favorites.retain(|p| p != &path);
+            self.message("Убрано из локального избранного", false);
+        } else {
+            self.settings.local_favorites.push(path);
+            self.message("Добавлено в избранное на этом компьютере. У этого старого файла нет исходной ссылки для синхронизации.",false);
+        }
+        self.changed();
+    }
+    fn local_favorites_ui(&mut self, ui: &mut egui::Ui) {
+        if self.settings.local_favorites.is_empty() {
+            return;
+        }
+        ui.strong("На этом компьютере");
+        ui.small("Старые файлы без исходной ссылки. Они доступны локально.");
+        let paths = self.settings.local_favorites.clone();
+        egui::ScrollArea::vertical()
+            .id_salt("local-favorites")
+            .max_height(if self.cloud_user.is_some() {
+                200.0
+            } else {
+                ui.available_height() - 45.0
+            })
+            .show_rows(ui, 44.0, paths.len(), |ui, range| {
+                for i in range {
+                    let p = &paths[i];
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                p.is_file(),
+                                egui::Button::new(
+                                    p.file_name().unwrap_or_default().to_string_lossy(),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            self.open_local(p.clone());
+                        }
+                        if !p.is_file() {
+                            ui.small("Файл перемещён или удалён");
+                        }
+                        if ui.small_button("Убрать").clicked() {
+                            self.toggle_local_favorite(p.clone());
+                        }
+                    });
+                }
+            });
+        ui.separator();
+    }
 }
