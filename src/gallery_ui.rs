@@ -92,7 +92,7 @@ impl GalleryApp {
             .max(1.0) as usize;
         let width = (ui.available_width() - (columns - 1) as f32 * 12.0) / columns as f32;
         let image_height = (width * 1.03).clamp(150.0, 300.0);
-        let row_height = image_height + 102.0;
+        let row_height = image_height + 126.0;
         let mut clicked = None;
         egui::ScrollArea::vertical().id_salt(id).show_rows(
             ui,
@@ -200,6 +200,7 @@ impl GalleryApp {
                                         {
                                             clicked = Some(index);
                                         }
+                                        self.photo_badges(ui, entry);
                                         let (title, subtitle) = match entry {
                                             GalleryEntry::Local(p) => (
                                                 p.file_name()
@@ -289,7 +290,7 @@ impl GalleryApp {
         let Some(loaded) = self.lightbox.as_ref().and_then(|g| g.loaded()) else {
             return;
         };
-        if matches!(loaded.source, Source::Disk(_)) || self.saving.contains(&loaded.meta.key) {
+        if matches!(loaded.source, Source::Disk(_)) || self.saved_sources.contains_key(&loaded.meta.key) || self.saving.contains(&loaded.meta.key) {
             return;
         }
         let meta = loaded.meta.clone();
@@ -350,18 +351,17 @@ impl GalleryApp {
             ui.add_space(8.0);
             let details=self.lightbox.as_ref().and_then(|g|g.loaded()).map(|l|(l.meta.clone(),l.source.clone(),l.dimensions));
             if let Some((meta,source,dimensions))=details{
-                let local=!(meta.key.starts_with("http://")||meta.key.starts_with("https://"));let starred=if local{matches!(&source,Source::Disk(p) if self.settings.local_favorites.contains(p))}else{self.cloud_data.favorites.iter().any(|p|p.key==meta.key)};
+                let local=!(meta.key.starts_with("http://")||meta.key.starts_with("https://"));let starred=if local{matches!(&source,Source::Disk(p) if self.settings.local_favorites.contains(p))}else{self.photo_favorite(&meta.key)};
                 ui.horizontal_wrapped(|ui|{
                     ui.label(format!("{} × {}",dimensions[0],dimensions[1]));if !meta.artist.is_empty(){ui.label(&meta.artist);}if let Some(url)=&meta.source{ui.hyperlink_to("Источник",url);}
 
                     if ui.add_enabled(local||!self.cloud_busy,icons::button(if starred{"В избранном"}else{"В избранное"},if starred{Icon::HeartFilled}else{Icon::Heart})).clicked(){favorite=true;}
-                    if ui.add_enabled(!matches!(source,Source::Disk(_))&&!self.saving.contains(&meta.key),icons::button(if matches!(source,Source::Disk(_)){"На компьютере"}else{"Сохранить"},Icon::Download)).clicked(){save=true;}
+                    if ui.add_enabled(!matches!(source,Source::Disk(_))&&!self.saved_sources.contains_key(&meta.key)&&!self.saving.contains(&meta.key),icons::button(if matches!(source,Source::Disk(_))||self.saved_sources.contains_key(&meta.key){"Сохранено"}else{"Сохранить"},Icon::Download)).clicked(){save=true;}
                     ui.add(egui::Slider::new(&mut self.lightbox.as_mut().unwrap().zoom,1.0..=4.0).text("Масштаб").show_value(false));
                 });
                 if favorite{
-                    if local{if let Source::Disk(path)=source{self.toggle_local_favorite(path);}}
-                    else if self.cloud_user.is_none(){self.account_open=true;close=true;}
-                    else{self.cloud_send(CloudJob::Op(if starred{serde_json::json!({"op":"favorite_remove","key":meta.key})}else{serde_json::json!({"op":"favorite_put","picture":meta})}));}
+                    self.toggle_photo_favorite(meta,match source{Source::Disk(path)=>Some(path),_=>None});
+                    if self.account_open {close=true;}
                 }
             }
             ui.add_space(8.0);

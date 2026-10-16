@@ -127,15 +127,20 @@ impl Api {
             ),
             ("PageSize", "1"),
         ];
+        let custom = query.custom_url.as_ref().map(|url| crate::sources::expand(url, &query.tag, &query.mode));
         let response = self.get(
-            query.custom_url.as_deref().unwrap_or(&default_url),
+            custom.as_deref().unwrap_or(&default_url),
             if query.custom_url.is_none() {
                 Some(&params)
             } else {
                 None
             },
-            true,
+            query.custom_url.is_none(),
         )?;
+        if custom.is_some() && response.headers().get("content-type").and_then(|v|v.to_str().ok()).is_some_and(|v|v.starts_with("image/")) {
+            let key=response.url().to_string();
+            return Ok(Download {bytes:bounded_body(response,MAX_BYTES)?,meta:Metadata{key,source:None,artist:String::new(),mode:query.mode.clone(),tag:query.tag.clone()}});
+        }
         let data: Value = serde_json::from_slice(&bounded_body(response, 2 * 1024 * 1024)?)
             .map_err(|e| format!("Некорректный JSON: {e}"))?;
         let (url, meta) = parse_image(&data, query)?;
@@ -175,7 +180,9 @@ fn retry_delay(header: Option<&str>, attempt: u32) -> Result<Duration, String> {
     Ok(Duration::from_secs_f64(delay))
 }
 pub fn parse_image(data: &Value, query: &Query) -> Result<(String, Metadata), String> {
-    let item = if let Some(items) = data.get("items") {
+    let item = if query.custom_url.is_some() {
+        crate::sources::image_item(data,0).map(|p|p.0).ok_or("Не найдена ссылка на изображение в JSON")?
+    } else if let Some(items) = data.get("items") {
         items
             .as_array()
             .ok_or("Некорректный список изображений")?
@@ -186,8 +193,13 @@ pub fn parse_image(data: &Value, query: &Query) -> Result<(String, Metadata), St
     } else {
         return Err("Нет списка изображений".into());
     };
-    let url = item["url"].as_str().ok_or("Нет ссылки на изображение")?;
-    checked_url(url)?;
+    let raw = if query.custom_url.is_some() { crate::sources::image_item(item,0).map(|p|p.1) } else { item["url"].as_str() }.ok_or("Нет ссылки на изображение")?;
+    let url = match checked_url(raw) {
+        Ok(url)=>url,
+        Err(_) if query.custom_url.is_some()=>checked_url(&crate::sources::expand(query.custom_url.as_ref().unwrap(),&query.tag,&query.mode))?.join(raw).map_err(|e|e.to_string())?,
+        Err(e)=>return Err(e),
+    };
+    checked_url(url.as_str())?;
     let artist = item["artists"]
         .as_array()
         .map(|a| {
@@ -207,9 +219,9 @@ pub fn parse_image(data: &Value, query: &Query) -> Result<(String, Metadata), St
         None => query.mode.clone(),
     };
     Ok((
-        url.into(),
+        url.to_string(),
         Metadata {
-            key: url.into(),
+            key: url.to_string(),
             source,
             artist,
             mode,

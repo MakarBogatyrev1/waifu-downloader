@@ -53,6 +53,9 @@ pub struct GalleryApp {
     os_pending: bool,
     style_key: Option<(bool, [u8; 3])>,
     tags: Vec<String>,
+    source_draft: crate::sources::SourceProfile,
+    source_status: String,
+    source_busy: bool,
     tag_search: String,
     tags_loading: bool,
     view: View,
@@ -67,6 +70,7 @@ pub struct GalleryApp {
     open_epoch: u64,
     opening: bool,
     saving: HashSet<String>,
+    saved_sources: HashMap<String,Vec<PathBuf>>,
     library: Vec<PathBuf>,
     library_epoch: u64,
     scanning: bool,
@@ -114,7 +118,7 @@ impl GalleryApp {
     pub fn new(cc: &eframe::CreationContext<'_>, base: PathBuf, smoke: bool) -> Self {
         let (settings, warning) = Settings::load(&base);
         let workers = Workers::start(cc.egui_ctx.clone());
-        let _ = workers.net.try_send(NetJob::Tags);
+        if !settings.use_custom_url {let _ = workers.net.try_send(NetJob::Tags);}
         let _ = workers.disk.try_send(DiskJob::Appearance);
         let cloud = cloud::Worker::start(cc.egui_ctx.clone());
         let _ = cloud
@@ -134,7 +138,7 @@ impl GalleryApp {
             update_status: "Обновления из GitHub Releases".into(),
             update_restart: false,
             install_after_exit: false,
-            settings,
+            settings: settings.clone(),
             workers,
             appearance: Appearance {
                 light: false,
@@ -143,9 +147,12 @@ impl GalleryApp {
             last_os_check: Instant::now(),
             os_pending: true,
             style_key: None,
+            source_draft: Default::default(),
+            source_status: String::new(),
+            source_busy: false,
             tags: vec!["waifu".into()],
             tag_search: String::new(),
-            tags_loading: true,
+            tags_loading: !settings.use_custom_url,
             view: View::Discover,
             history: vec![],
             selected: None,
@@ -158,6 +165,7 @@ impl GalleryApp {
             open_epoch: 0,
             opening: false,
             saving: HashSet::new(),
+            saved_sources: HashMap::new(),
             library: vec![],
             library_epoch: 0,
             scanning: false,
@@ -202,6 +210,7 @@ impl GalleryApp {
             closing: false,
             capture_after: Instant::now(),
         };
+        if app.settings.use_custom_url {app.refresh_source_tags();}
         app.scan();
         app.apply_style(&cc.egui_ctx);
         app
@@ -368,7 +377,7 @@ impl GalleryApp {
             loaded.thumbnail,
             TextureOptions::LINEAR,
         );
-        let saved = matches!(loaded.source, Source::Disk(_));
+        let saved = matches!(loaded.source, Source::Disk(_)) || self.saved_sources.contains_key(&loaded.meta.key);
         self.history.insert(
             0,
             Item {
@@ -431,7 +440,7 @@ impl GalleryApp {
             return;
         };
         let item = &self.history[index];
-        if item.saved || self.saving.contains(&item.meta.key) {
+        if item.saved || self.saved_sources.contains_key(&item.meta.key) || self.saving.contains(&item.meta.key) {
             return;
         }
         let folder = self
@@ -461,6 +470,7 @@ impl GalleryApp {
     fn events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.workers.events.try_recv() {
             match event {
+                Event::SavedIndex(epoch,index) => {if epoch==self.library_epoch{self.saved_sources=index;}},
                 Event::Gallery(epoch, result) => {
                     self.gallery_result(ctx, epoch, result);
                 }
@@ -487,7 +497,14 @@ impl GalleryApp {
                         }
                     }
                 }
+                Event::SourceTags(url, mode, result) => {
+                    if self.settings.use_custom_url && self.settings.custom_url==url && self.settings.mode==mode {
+                        self.source_busy=false;self.tags_loading=false;
+                        match result {Ok(tags)=>{let template=crate::sources::infer_template(&url,&tags);self.settings.custom_url=template.clone();self.invalidate();self.source_status=format!("Найдено категорий: {}",tags.len());if let Some(p)=self.settings.sources.iter_mut().find(|p|p.url==url){p.categories=tags.clone();p.categories_mode=mode.clone();p.url=template;}self.set_source_tags(tags);self.changed();},Err(e)=>self.source_status=e}
+                    }
+                },
                 Event::Tags(result) => {
+                    if self.settings.use_custom_url {continue;}
                     self.tags_loading = false;
                     match result {
                         Ok(tags) => {
@@ -560,6 +577,7 @@ impl GalleryApp {
                     self.saving.remove(&key);
                     match result {
                         Ok(path) => {
+                            let paths=self.saved_sources.entry(key.clone()).or_default();if !paths.contains(&path){paths.push(path.clone());}
                             if let Some(g) = self.lightbox.as_mut() {
                                 for (_, loaded) in &mut g.cache {
                                     if loaded.meta.key == key {
@@ -785,8 +803,8 @@ impl GalleryApp {
                         .map(|i| {
                             let item = &self.history[i];
                             (
-                                !item.saved && !self.saving.contains(&item.meta.key),
-                                if item.saved {
+                                !item.saved && !self.saved_sources.contains_key(&item.meta.key) && !self.saving.contains(&item.meta.key),
+                                if item.saved || self.saved_sources.contains_key(&item.meta.key) {
                                     "Сохранено"
                                 } else if self.saving.contains(&item.meta.key) {
                                     "Сохраняем…"
@@ -818,7 +836,7 @@ impl GalleryApp {
                             path.as_ref()
                                 .is_some_and(|p| self.settings.local_favorites.contains(p))
                         } else {
-                            self.cloud_data.favorites.iter().any(|p| p.key == meta.key)
+                            self.photo_favorite(&meta.key)
                         };
                         if ui
                             .add_enabled(
@@ -839,21 +857,7 @@ impl GalleryApp {
                             )
                             .clicked()
                         {
-                            if local {
-                                if let Some(path) = path {
-                                    self.toggle_local_favorite(path);
-                                }
-                            } else if self.cloud_user.is_none() {
-                                self.account_open = true;
-                            } else if favorite {
-                                self.cloud_send(CloudJob::Op(
-                                    serde_json::json!({"op":"favorite_remove","key":meta.key}),
-                                ));
-                            } else {
-                                self.cloud_send(CloudJob::Op(
-                                    serde_json::json!({"op":"favorite_put","picture":meta}),
-                                ));
-                            }
+                            self.toggle_photo_favorite(meta,path);
                         }
                     }
                 } else if self.view == View::Collection {
@@ -891,6 +895,7 @@ impl GalleryApp {
                         && self.settings.mode != mode
                     {
                         self.settings.mode = mode.into();
+                        if self.settings.use_custom_url {self.refresh_source_tags();}
                         self.invalidate();
                     }
                 }
@@ -1196,7 +1201,7 @@ impl GalleryApp {
         let mut open = true;
         egui::Window::new("Настройки").open(&mut open).default_width(560.0).default_height(430.0)
             .default_pos(ctx.screen_rect().center()-egui::vec2(280.0,230.0)).resizable(false).collapsible(false).show(ctx,|ui|{
-                ui.horizontal(|ui|{for (i,label) in [(0,"Оформление"),(1,"Сохранение"),(2,"Дополнительно")]{ui.selectable_value(&mut self.settings_tab,i,label);}});
+                ui.horizontal(|ui|{for (i,label) in [(0,"Оформление"),(1,"Сохранение"),(2,"Дополнительно"),(3,"Источники")]{ui.selectable_value(&mut self.settings_tab,i,label);}});
                 ui.add_space(16.0);
                 egui::ScrollArea::vertical().max_height(470.0).show(ui,|ui|{
                     ui.set_min_height(300.0);
@@ -1218,13 +1223,14 @@ impl GalleryApp {
                             egui::ComboBox::from_id_salt("load-mode").selected_text(match self.settings.load_saved_mode{1=>"Текущую категорию",2=>"Все категории текущего режима",_=>"Все изображения"}).show_ui(ui,|ui|{ui.selectable_value(&mut self.settings.load_saved_mode,1,"Текущую категорию");ui.selectable_value(&mut self.settings.load_saved_mode,2,"Все категории текущего режима");ui.selectable_value(&mut self.settings.load_saved_mode,3,"Все изображения");});
                             ui.small("Пути к папкам и скачанные файлы остаются на этом устройстве.");
                         },
-                        _=>{
+                        2=>{
                             ui.label(RichText::new("Загрузка и управление").size(24.0).strong());ui.add_space(16.0);
                             ui.checkbox(&mut self.settings.prefetch,"Предзагружать следующую картинку");ui.small("Следующая картинка будет готова быстрее. Расходует трафик.");
-                            ui.add_space(14.0);ui.collapsing("Пользовательский источник",|ui|{ui.checkbox(&mut self.settings.use_custom_url,"Использовать свой API");ui.add_enabled(self.settings.use_custom_url,egui::TextEdit::singleline(&mut self.settings.custom_url).hint_text("https://…").desired_width(f32::INFINITY));ui.small("JSON с items[0].url или url. Категории задаются в URL.");});
+                            
                             ui.add_space(18.0);self.update_settings_ui(ui,ctx);
                             ui.add_space(18.0);ui.strong("Горячие клавиши");ui.label("Пробел / N — новая картинка\nS — сохранить\n← / → — история\nCtrl+, — настройки");
                         }
+                        _=>{self.sources_ui(ui);}
                     }
                 });
             });
@@ -1277,6 +1283,7 @@ impl GalleryApp {
                 .try_send(DiskJob::Scan(
                     self.library_epoch,
                     self.settings.library_roots(&self.base),
+                    {let mut settings=self.settings.clone();settings.load_saved_mode=3;settings.library_roots(&self.base)},
                 ))
                 .is_ok()
         {
@@ -1336,6 +1343,7 @@ impl GalleryApp {
                 10 => "preview-collection.png",
                 14 => "preview-account.png",
                 17 => "preview-gallery.png",
+                20 => "preview-sources.png",
                 _ => "preview.png",
             };
             let rgba: Vec<u8> = image.pixels.iter().flat_map(|p| p.to_array()).collect();
@@ -1357,6 +1365,9 @@ impl GalleryApp {
                     self.smoke_phase = 7;
                 }
                 8 => {
+                    self.settings_tab=3;self.capture_after=Instant::now()+Duration::from_millis(400);self.smoke_phase=19;
+                }
+                20 => {
                     self.settings_open = false;
                     self.account_open = true;
                     self.capture_after = Instant::now() + Duration::from_millis(400);
@@ -1371,6 +1382,8 @@ impl GalleryApp {
                     self.smoke_phase = 9;
                 }
                 10 => {
+                    let path=self.smoke_path.as_ref().unwrap().clone();
+                    if !self.settings.local_favorites.contains(&path){self.toggle_local_favorite(path);}
                     self.open_local(self.smoke_path.as_ref().unwrap().clone());
                     self.smoke_phase = 11;
                 }
@@ -1385,7 +1398,7 @@ impl GalleryApp {
                 self.smoke_phase = 1;
             }
             1 if self.selected.is_some() && !self.waiting => {
-                self.save_current();
+                if let Some(path)=self.saved_sources.get(&self.history[self.selected.unwrap()].meta.key).and_then(|paths|paths.first()).cloned(){self.smoke_path=Some(path);}else{self.save_current();}
                 self.smoke_phase = 2;
             }
             2 if self.smoke_path.is_some() && !self.scanning && !self.scan_due => {
@@ -1405,6 +1418,9 @@ impl GalleryApp {
             7 if Instant::now() >= self.capture_after => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
                 self.smoke_phase = 8;
+            }
+            19 if Instant::now() >= self.capture_after => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));self.smoke_phase=20;
             }
             13 if Instant::now() >= self.capture_after => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
@@ -1450,13 +1466,13 @@ impl GalleryApp {
             {
                 let loaded = self.lightbox.as_ref().unwrap().loaded().unwrap();
                 let path = self.smoke_path.as_ref().unwrap();
-                let ok = self.view == View::Collection
+                let ok = self.saved_sources.contains_key(&loaded.meta.key) && self.photo_favorite(&loaded.meta.key) && self.view == View::Collection
                     && self.history.len() == 1
                     && matches!(&loaded.source,Source::Disk(p) if p==path)
                     && image::image_dimensions(path)
                         .is_ok_and(|d| d == (loaded.dimensions[0], loaded.dimensions[1]))
                     && loaded.meta.key.starts_with("http");
-                let _=std::fs::write(self.base.join("smoke-result.txt"),format!("{}: gallery_separate=true, next_previous=true, history_len={}, dimensions={:?}",if ok{"OK"}else{"FAILED"},self.history.len(),loaded.dimensions));
+                let _=std::fs::write(self.base.join("smoke-result.txt"),format!("{}: saved_index=true, favorite=true, gallery_separate=true, next_previous=true, history_len={}, dimensions={:?}",if ok{"OK"}else{"FAILED"},self.history.len(),loaded.dimensions));
                 self.smoke_phase = 12;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -1671,3 +1687,7 @@ mod tests {
         assert_eq!(history.last().unwrap().meta.key, "23");
     }
 }
+
+include!("source_ui.rs");
+
+include!("photo_state.rs");

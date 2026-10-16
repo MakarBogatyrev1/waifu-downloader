@@ -14,6 +14,7 @@ use std::{
 };
 
 pub enum NetJob {
+    SourceTags(crate::sources::SourceProfile, String),
     Gallery(u64, Metadata),
     Tags,
     Image(u64, Query),
@@ -22,13 +23,15 @@ pub enum DiskJob {
     Gallery(u64, PathBuf),
     Open(u64, Source, Metadata),
     Thumb(PathBuf),
-    Scan(u64, Vec<PathBuf>),
+    Scan(u64, Vec<PathBuf>, Vec<PathBuf>),
     SaveWithMetadata(Metadata, Source, PathBuf),
     Settings(Settings, PathBuf),
     Appearance,
     Flush(Sender<()>),
 }
 pub enum Event {
+    SavedIndex(u64, std::collections::HashMap<String, Vec<PathBuf>>),
+    SourceTags(String, String, Result<Vec<String>,String>),
     Gallery(u64, Result<Box<Loaded>, String>),
     RemoteThumb(String, Result<ColorImage, String>),
     Tags(Result<Vec<String>, String>),
@@ -77,6 +80,11 @@ impl Workers {
             let api = Api::new();
             while let Ok(job) = net_rx.recv() {
                 let event = match job {
+                    NetJob::SourceTags(profile, mode) => {
+                        let tx=nt.clone();let ctx=nc.clone();
+                        std::thread::spawn(move || {let result=crate::sources::discover(&profile,&mode);emit(&tx,&ctx,Event::SourceTags(profile.url,mode,result));});
+                        continue;
+                    },
                     NetJob::Gallery(epoch, meta) => Event::Gallery(
                         epoch,
                         api.as_ref().map_err(Clone::clone).and_then(|api| {
@@ -99,6 +107,7 @@ impl Workers {
             }
         });
         std::thread::spawn(move || {
+            let mut saved_index:std::collections::HashMap<String,Vec<PathBuf>>=Default::default();
             while let Ok(job) = disk_rx.recv() {
                 let event = match job {
                     DiskJob::Gallery(epoch, path) => Event::Gallery(
@@ -107,8 +116,10 @@ impl Workers {
                             .map(Box::new),
                     ),
                     DiskJob::SaveWithMetadata(meta, source, folder) => {
-                        let result = assets::save_png(&source, &folder);
+                        let existing=saved_index.get(&meta.key).and_then(|paths|paths.iter().find(|p|p.is_file())).cloned();
+                        let result = if let Some(path)=existing {Ok(path)} else {assets::save_png(&source, &folder)};
                         if let Ok(path) = &result {
+                            let paths=saved_index.entry(meta.key.clone()).or_default();if !paths.contains(path){paths.push(path.clone());}
                             if let Err(e) = assets::save_metadata(path, &meta) {
                                 emit(
                                     &tx,
@@ -128,7 +139,14 @@ impl Workers {
                         Event::Open(epoch, assets::load(source, meta).map(Box::new))
                     }
                     DiskJob::Thumb(path) => Event::Thumb(path.clone(), assets::thumbnail(&path)),
-                    DiskJob::Scan(epoch, roots) => Event::Scan(epoch, assets::scan(roots)),
+                    DiskJob::Scan(epoch, roots, all_roots) => {
+                        if let Ok(paths)=assets::scan(all_roots) {
+                            saved_index.clear();
+                            for path in paths {saved_index.entry(assets::disk_metadata(&path).key).or_default().push(path);}
+                            emit(&tx,&ctx,Event::SavedIndex(epoch,saved_index.clone()));
+                        }
+                        Event::Scan(epoch, assets::scan(roots))
+                    },
                     DiskJob::Settings(settings, base) => Event::Settings(settings.save(&base)),
                     DiskJob::Appearance => Event::Appearance(system::read()),
                     DiskJob::Flush(done) => {
@@ -194,6 +212,15 @@ mod tests {
             assets::disk_metadata(&paths[0]).key,
             "https://example.com/key.png"
         );
+        // A second request with the same source must reuse the existing file,
+        // even after rebuilding the index as happens on application restart.
+        workers.disk.send(DiskJob::Scan(1,vec![folder.clone()],vec![folder.clone()])).unwrap();
+        workers.disk.send(DiskJob::SaveWithMetadata(assets::disk_metadata(&paths[0]),Source::Memory(Arc::new(vec![])),folder.clone())).unwrap();
+        let (tx,rx)=mpsc::channel();workers.disk.send(DiskJob::Flush(tx)).unwrap();rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(assets::scan(vec![folder.clone()]).unwrap(),paths);
+        let mut reused=false;
+        while let Ok(event)=workers.events.try_recv(){if let Event::Saved(_,result)=event{assert_eq!(result.unwrap(),paths[0]);reused=true;}}
+        assert!(reused);
         std::fs::remove_file(paths[0].with_extension("waifu.json")).unwrap();
         std::fs::remove_file(&paths[0]).unwrap();
         std::fs::remove_dir(folder).unwrap();

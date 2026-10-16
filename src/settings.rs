@@ -23,6 +23,7 @@ pub struct Settings {
     pub load_saved_mode: u8,
     pub use_custom_url: bool,
     pub custom_url: String,
+    pub sources: Vec<crate::sources::SourceProfile>,
     pub theme: Theme,
     pub accent: [u8; 3],
     pub system_accent: bool,
@@ -43,6 +44,7 @@ impl Default for Settings {
             load_saved_mode: 2,
             use_custom_url: false,
             custom_url: String::new(),
+            sources: vec![],
             theme: Theme::System,
             accent: [159, 123, 255],
             system_accent: true,
@@ -68,7 +70,7 @@ impl Settings {
         if self.mode != "SFW" && self.mode != "NSFW" {
             self.mode = "SFW".into();
         }
-        if !valid_tag(&self.category) {
+        if !(if self.use_custom_url {crate::sources::category_ok(&self.category)} else {valid_tag(&self.category)}) {
             self.category = "waifu".into();
         }
         if !["A", "B", "C"].contains(&self.save_mode.as_str()) {
@@ -140,7 +142,7 @@ impl Settings {
     pub fn library_roots(&self, base: &Path) -> Vec<PathBuf> {
         let root = base.join("images");
         let mut roots = vec![match self.load_saved_mode {
-            1 => root.join(self.mode.to_lowercase()).join(&self.category),
+            1 => root.join(self.mode.to_lowercase()).join(if valid_tag(&self.category) {self.category.as_str()} else {"waifu"}),
             2 => root.join(self.mode.to_lowercase()),
             _ => root.clone(),
         }];

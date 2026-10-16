@@ -7,6 +7,7 @@ mod gallery;
 mod icons;
 mod install;
 mod settings;
+mod sources;
 mod system;
 mod updater;
 mod worker;
